@@ -498,12 +498,13 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
         return false;
     }
     host = endpoint.substr(0, pos);
-    try {
-        port = std::stoi(endpoint.substr(pos + 1));
-    } catch (...) {
+    // check every character: stoi stops at the first non-digit and htons truncates big ports
+    const std::string port_str = endpoint.substr(pos + 1);
+    if (port_str.empty() || port_str.size() > 5 || port_str.find_first_not_of("0123456789") != std::string::npos) {
         return false;
     }
-    return true;
+    port = std::stoi(port_str);
+    return port <= 65535;
 }
 
 // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
@@ -3672,6 +3673,12 @@ ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
         return nullptr;
     }
     auto server = std::make_unique<ggml_backend_rpc_server>();
+    // validate the endpoint before initializing any device
+    int port;
+    if (!parse_endpoint(endpoint, server->host, port)) {
+        fprintf(stderr, "Invalid endpoint: %s\n", endpoint);
+        return nullptr;
+    }
     server->has_cache_dir = cache_dir != nullptr;
     if (server->has_cache_dir) {
         server->cache_dir = cache_dir;
@@ -3701,11 +3708,6 @@ ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
                 ggml_backend_set_n_threads_fn(backend, n_threads);
             }
         }
-    }
-
-    int port;
-    if (!parse_endpoint(endpoint, server->host, port)) {
-        return nullptr;
     }
 
 #ifdef GGML_RPC_RDMA

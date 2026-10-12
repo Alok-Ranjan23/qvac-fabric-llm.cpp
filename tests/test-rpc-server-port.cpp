@@ -1,11 +1,13 @@
 // Starts a managed RPC server on port 0 through the backend registry, the way
-// in-process hosts do, and checks that it reports a port a client can reach.
+// in-process hosts do, and checks that it reports a port a client can reach and
+// that malformed endpoints are rejected.
 
 #include "ggml-backend.h"
 #include "ggml-rpc.h"
 
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
 #include <thread>
 
 #ifdef _WIN32
@@ -78,6 +80,17 @@ int main() {
     if (server_get_port(nullptr) != -1) {
         fprintf(stderr, "get_port(NULL) did not return -1\n");
         return 1;
+    }
+
+    // a malformed port must fail, not bind a port the caller did not ask for
+    for (const char * endpoint : { "50052", "127.0.0.1:", "127.0.0.1:abc", "127.0.0.1:65536",
+                                   "127.0.0.1:-1", "127.0.0.1:+1", "127.0.0.1:50052abc" }) {
+        ggml_backend_rpc_server_t rejected = server_create(endpoint, nullptr, 1, 1, &cpu);
+        if (rejected != nullptr) {
+            fprintf(stderr, "endpoint %s was accepted on port %d\n", endpoint, server_get_port(rejected));
+            server_free(rejected);
+            return 1;
+        }
     }
 
     ggml_backend_rpc_server_t server = server_create("127.0.0.1:0", nullptr, 1, 1, &cpu);
