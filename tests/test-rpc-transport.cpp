@@ -327,25 +327,30 @@ static void set_no_rdma(bool disabled) {
 #endif
 }
 
+// Whether RDMA is available also depends on the libibverbs version and on an RDMA
+// device being present, so only check what always holds.
 static bool test_rdma_available() {
 #if defined(GGML_RPC_RDMA) && !defined(GGML_RPC_RDMA_APPLE)
-    // RDMA is tried only when libibverbs can be loaded
-    void *     lib      = dlopen("libibverbs.so.1", RTLD_NOW | RTLD_LOCAL);
-    const bool expected = lib != nullptr;
+    void *     lib            = dlopen("libibverbs.so.1", RTLD_NOW | RTLD_LOCAL);
+    const bool library_loaded = lib != nullptr;
     if (lib != nullptr) {
         dlclose(lib);
     }
 #else
-    const bool expected = false;
+    const bool library_loaded = false;
 #endif
     set_no_rdma(false);
     const bool available = rpc_transport_rdma_available();
     set_no_rdma(true);
     const bool disabled = rpc_transport_rdma_available();
     set_no_rdma(false);
-    printf("RDMA available: %s (expected %s)\n", available ? "yes" : "no", expected ? "yes" : "no");
-    if (available != expected || disabled) {
-        fprintf(stderr, "rpc_transport_rdma_available() returned %d, %d with GGML_RPC_NO_RDMA\n", available, disabled);
+    printf("RDMA available: %s\n", available ? "yes" : "no");
+    if (disabled) {
+        fprintf(stderr, "rpc_transport_rdma_available() returned true with GGML_RPC_NO_RDMA\n");
+        return false;
+    }
+    if (available && !library_loaded) {
+        fprintf(stderr, "rpc_transport_rdma_available() returned true without an RDMA library\n");
         return false;
     }
     return true;

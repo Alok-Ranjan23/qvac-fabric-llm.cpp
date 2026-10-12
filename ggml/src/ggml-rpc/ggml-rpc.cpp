@@ -3711,7 +3711,10 @@ ggml_backend_rpc_server_t ggml_backend_rpc_server_create(
     }
 
 #ifdef GGML_RPC_RDMA
-    if (rpc_transport_rdma_available()) {
+    // tell a deliberate opt-out apart from a host that cannot use RDMA
+    if (std::getenv("GGML_RPC_NO_RDMA")) {
+        printf("  transport      : TCP (RDMA disabled by GGML_RPC_NO_RDMA)\n");
+    } else if (rpc_transport_rdma_available()) {
         printf("  transport      : TCP (RDMA auto-negotiate enabled)\n");
     } else {
         printf("  transport      : TCP (RDMA unavailable)\n");

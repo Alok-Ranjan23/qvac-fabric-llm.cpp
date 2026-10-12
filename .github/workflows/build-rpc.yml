@@ -126,8 +126,12 @@ jobs:
             exit 1
           fi
           ctest -R '^test-rpc(-transport|-server-port)?$' --verbose
-          # libibverbs is installed, so the servers loaded it and offer RDMA
-          grep -q 'RDMA auto-negotiate enabled' rpc-server-0.log
+          # libibverbs is installed, so the servers must have loaded all of it. The
+          # runner has no RDMA device, so they still report RDMA as unavailable.
+          if grep -E 'cannot load libibverbs|libibverbs.so.1 has no' rpc-server-0.log; then
+            printf '%s\n' "the RPC server could not load the installed libibverbs"
+            exit 1
+          fi
           if [ "$(grep -c '\[set_tensor_2d\] saved to' rpc-server-0.log)" -ne 1 ]; then
             printf '%s\n' "2D tensor cache test did not record exactly one upload"
             exit 1
@@ -176,5 +180,6 @@ jobs:
             exit 1
           fi
           ctest -R '^test-rpc(-transport|-server-port)?$' --verbose
+          grep -q 'cannot load libibverbs.so.1' rpc-tcp-server-0.log
           grep -q 'RDMA unavailable' rpc-tcp-server-0.log
           grep -q 'RDMA unavailable' rpc-tcp-server-1.log
