@@ -185,12 +185,13 @@ def print_prompt_result(idx, row, before):
           f"pwr {before['gpu_pwrlevel']}->{row['thermal_after']['gpu_pwrlevel']}", flush=True)
 
 
-def run_prompts(dev, prompts, n_predict, base_row, out):
-    for idx, text in enumerate(prompts):
-        before = read_thermal(dev)
-        resp = run_completion(dev, render_prompt(dev, text), n_predict)
+def run_prompts(ctx, base_row, out):
+    for idx, text in enumerate(ctx.prompts):
+        wait_for_cool(ctx.dev, ctx.cool_per_prompt)
+        before = read_thermal(ctx.dev)
+        resp = run_completion(ctx.dev, render_prompt(ctx.dev, text), ctx.n_predict)
         row = {**base_row, "prompt_idx": idx, "thermal_before": before,
-               "thermal_after": read_thermal(dev), **timings_row(resp)}
+               "thermal_after": read_thermal(ctx.dev), **timings_row(resp)}
         out.write(json.dumps(row) + "\n")
         out.flush()
         print_prompt_result(idx, row, before)
@@ -205,7 +206,7 @@ def run_cell(ctx, build, model, cfg_name, pass_idx, out):
     load_s = wait_for_health(ctx.dev, log_name)
     base_row = {"build": build, "model": model, "config": cfg_name, "pass": pass_idx,
                 "env": ctx.env, "load_s": load_s, "cool_wait_s": cool_wait, "ts": time.time()}
-    run_prompts(ctx.dev, ctx.prompts, ctx.n_predict, base_row, out)
+    run_prompts(ctx, base_row, out)
     stop_server(ctx.dev)
     time.sleep(BETWEEN_LAUNCH_S)
 
@@ -239,6 +240,7 @@ class RunContext:
         self.n_predict = args.n_predict
         self.prompts = load_prompts(args.prompts_file)
         self.cool_gate = not args.no_cool_gate
+        self.cool_per_prompt = self.cool_gate and args.cool_per_prompt
         self.server_args = ["-ngl", "99", "-c", str(args.ctx), "-np", "1", "--no-cache-prompt",
                             "--port", str(args.device_port), "--host", "127.0.0.1"]
 
@@ -268,6 +270,7 @@ def parse_args():
     p.add_argument("--ctx", type=int, default=DEFAULT_CTX)
     p.add_argument("--prompts-file", default="", help="one prompt per line; default: three built-in prompts")
     p.add_argument("--no-cool-gate", action="store_true", help="do not wait for the GPU to cool before each launch")
+    p.add_argument("--cool-per-prompt", action="store_true", help="also wait for the GPU to cool before each prompt")
     p.add_argument("--wait-for-process", default="", help="pgrep -f pattern to wait on before starting (shared devices)")
     p.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
     p.add_argument("--tag", default="run")
