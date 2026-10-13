@@ -9375,6 +9375,30 @@ static bool ggml_cl_pq2_0_matches_weight_rows(const ggml_tensor * t) {
     return ggml_is_contiguous(t) && t->view_offs == 0 && t->ne[0] == weight->ne[0];
 }
 
+// The weight a view reads: set_tensor gave that weight its extra and its repacked layout.
+static const ggml_tensor * ggml_cl_layout_owner(const ggml_tensor * tensor) {
+    return tensor->view_src != nullptr ? tensor->view_src : tensor;
+}
+
+static constexpr int64_t Q6K_ROW_VIEW_ALIGN = 128; // rows per exact-cover unit of the noshuffle GEMVs
+
+// A row range of a noshuffle q6_K weight runs on the 1-column GEMVs, which take its first row and the weight's
+// row stride; the multi-column, tiled and GEMM paths address only whole weights.
+static bool ggml_cl_q6_K_row_view_supported(const ggml_backend_opencl_context * backend_ctx, const ggml_tensor * op) {
+    if (ggml_is_empty(op)) {
+        return true; // graph_compute skips empty nodes, so nothing reads the view
+    }
+    const ggml_tensor * a = op->src[0];
+    const ggml_tensor * b = op->src[1];
+    const ggml_tensor * w = ggml_cl_layout_owner(a);
+    const bool row_range = a->ne[0] == w->ne[0] && a->nb[1] == w->nb[1] && a->ne[2] == 1 && a->ne[3] == 1 &&
+                           a->view_offs % a->nb[1] == 0;
+    const int64_t row0 = a->view_offs / a->nb[1];
+    return row_range && b->ne[1] == 1 && b->ne[2] == 1 && b->ne[3] == 1 &&
+           row0 % Q6K_ROW_VIEW_ALIGN == 0 && a->ne[1] % Q6K_ROW_VIEW_ALIGN == 0 &&
+           !use_q6k_tiled(backend_ctx, w) && use_adreno_kernels(backend_ctx, a);
+}
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -9667,6 +9691,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
                     if (!uses_gemm && op->src[1]->ne[1] >= 512) {
                         return false;
                     }
+                }
+                if (op->src[0]->view_src != nullptr && ggml_cl_q6_K_uses_noshuffle(backend_ctx, op->src[0]->view_src) &&
+                    !ggml_cl_q6_K_row_view_supported(backend_ctx, op)) {
+                    return false;
                 }
                 return op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
             } else if (op->src[0]->type == GGML_TYPE_Q8_0) {
@@ -22216,7 +22244,9 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
 
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
 
-    ggml_tensor_extra_cl_q6_K * extra0_q6_K = (ggml_tensor_extra_cl_q6_K *)src0->extra;
+    const ggml_tensor * w = ggml_cl_layout_owner(src0);
+
+    ggml_tensor_extra_cl_q6_K * extra0_q6_K = (ggml_tensor_extra_cl_q6_K *)w->extra;
     ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
 
@@ -22225,6 +22255,8 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
 
     const int ne00 = src0->ne[0];
     const int ne01 = src0->ne[1];
+    const int ne01_w = w->ne[1];                              // the layout's row stride
+    const int row0   = (int) (src0->view_offs / src0->nb[1]); // first weight row of a row-range view
 
     const int ne1 = dst->ne[1];
 
@@ -22244,7 +22276,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
     // GEMV — streams the large lm_head weight once across the 3 verify columns.
     // Opt-in via GGML_OPENCL_Q6K_MC3=1.
     static const bool q6k_tiled_mc3 = (getenv("GGML_OPENCL_Q6K_MC3") != nullptr);
-    const bool use_q6k_tiled_mc = q6k_tiled_mc3 && (ne1 == 3) && (ne01 >= 32768) && use_q6k_tiled(backend_ctx, src0);
+    const bool use_q6k_tiled_mc = q6k_tiled_mc3 && (ne1 == 3) && (ne01 >= 32768) && use_q6k_tiled(backend_ctx, w);
 
     if (ne1 == 1 || use_mc || use_q6k_tiled_mc) {
         cl_mem ql_img = nullptr;
@@ -22264,7 +22296,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             const char * e = std::getenv("GGML_OPENCL_Q6K_GEMV_O4_GLOBAL");
             return !e || e[0] == '\0' || e[0] != '0';
         }();
-        const bool use_tiled     = !use_mc && use_q6k_tiled(backend_ctx, src0);
+        const bool use_tiled     = !use_mc && use_q6k_tiled(backend_ctx, w);
         const bool use_o4        = !use_tiled && !use_mc && q6k_gemv_o4_enabled(backend_ctx) && (ne01 % 4 == 0) && (ne01 >= 32768);
         const bool use_o4_global = use_o4 && o4_global_env;
 
@@ -22275,7 +22307,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             img_fmt.image_channel_data_type = CL_FLOAT;
             memset(&img_desc, 0, sizeof(img_desc));
             img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-            img_desc.image_width = ne01 * ne00 / 8;
+            img_desc.image_width = ne01_w * ne00 / 8;
             img_desc.buffer = extra0_q6_K->ql;
             CL_CHECK((ql_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
 
@@ -22284,7 +22316,7 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
             img_fmt.image_channel_data_type = CL_HALF_FLOAT;
             memset(&img_desc, 0, sizeof(img_desc));
             img_desc.image_type = CL_MEM_OBJECT_IMAGE1D_BUFFER;
-            img_desc.image_width = ne01 * ne00 / 8;
+            img_desc.image_width = ne01_w * ne00 / 8;
             img_desc.buffer = extra0_q6_K->qh;
             CL_CHECK((qh_img = clCreateImage(context, CL_MEM_READ_ONLY, &img_fmt, &img_desc, NULL, &err), err));
         }
@@ -22322,6 +22354,12 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 6, sizeof(cl_ulong), &offsetd));
         CL_CHECK(clSetKernelArg(kernel, 7, sizeof(cl_int),   &ne00));
         CL_CHECK(clSetKernelArg(kernel, 8, sizeof(cl_int),   &ne01));
+        const bool takes_row_range = !use_mc && !use_q6k_tiled_mc && !use_tiled;
+        GGML_ASSERT((takes_row_range || src0 == w) && "a q6_K row view runs only on the 1-column GEMVs");
+        if (takes_row_range) {
+            CL_CHECK(clSetKernelArg(kernel, 9,  sizeof(cl_int), &row0));
+            CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_int), &ne01_w));
+        }
 
         const size_t gws_x = use_tiled
                                  ? (size_t) CEIL_DIV(ne01, 64) * 64
@@ -22348,7 +22386,8 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
         // the plain noshuffle GEMM below reads it as plain-transposed and produces
         // garbage. Use the batched GEMM that matches the decode tiled GEMV's
         // layout; it reads the f32 activation directly (column-major, no transpose).
-        if (use_q6k_tiled(backend_ctx, src0)) {
+        GGML_ASSERT(src0 == w && "a q6_K row view runs only on the 1-column GEMVs");
+        if (use_q6k_tiled(backend_ctx, w)) {
             cl_mem b_sub_buf_t = nullptr;
             cl_mem b_img_t     = nullptr;
 
@@ -23689,7 +23728,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         }
 
         // q6_K x fp32
-        if (src0t == GGML_TYPE_Q6_K && src1t == GGML_TYPE_F32 && !use_flat_gemv_for_large_m_q6_K(backend_ctx, src0)) {
+        if (src0t == GGML_TYPE_Q6_K && src1t == GGML_TYPE_F32 && !use_flat_gemv_for_large_m_q6_K(backend_ctx, ggml_cl_layout_owner(src0))) {
             ggml_cl_mul_mat_q6_K_f32_adreno(backend, src0, src1, dst);
             return;
         }

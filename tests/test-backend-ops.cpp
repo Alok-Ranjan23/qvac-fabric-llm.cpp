@@ -6239,6 +6239,59 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT over a contiguous row range of a larger weight, as a reduced-vocabulary draft head uses it
+struct test_mul_mat_rows : public test_case {
+    const ggml_type type_a;
+    const int64_t m;    // rows of the whole weight
+    const int64_t n;
+    const int64_t k;
+    const int64_t row0; // first row of the view
+    const int64_t rows; // rows of the view
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, m, n, k, row0, rows);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_rows(ggml_type type_a, int64_t m, int64_t n, int64_t k, int64_t row0, int64_t rows)
+        : type_a(type_a), m(m), n(n), k(k), row0(row0), rows(rows) {}
+
+    // a model sets only the weight; writing through the view would re-layout part of it on backends that repack
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src == nullptr) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(row0 + rows <= m);
+
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * a_rows = ggml_view_2d(ctx, a, k, rows, a->nb[1], row0*a->nb[1]);
+        ggml_set_name(a_rows, "a_rows");
+
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a_rows, b);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
 static ggml_backend_buffer_type_t test_repacked_weight_buffer_type(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -14065,6 +14118,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // vocab-scale q6_K output head: one token and speculative verify batches
     for (int64_t n : {1, 2, 3, 4, 8}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 32768, n, 2048, {1, 1}, {1, 1}));
+    }
+    // row ranges of a vocab-scale q6_K head: from row 0, at an offset, and a short tail; n 0 is a step that keeps no logits
+    for (int64_t n : {0, 1, 4}) {
+        test_cases.emplace_back(new test_mul_mat_rows(GGML_TYPE_Q6_K, 65536, n, 2048,     0, 32768));
+        test_cases.emplace_back(new test_mul_mat_rows(GGML_TYPE_Q6_K, 65536, n, 2048, 32768, 32768));
+        test_cases.emplace_back(new test_mul_mat_rows(GGML_TYPE_Q6_K, 65536, n, 2048, 65024,   512));
     }
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 576, 512, 576, {1,1}, {1,1}));
