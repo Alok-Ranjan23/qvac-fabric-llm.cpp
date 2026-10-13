@@ -1857,8 +1857,8 @@ static constexpr size_t KQUANT_MC_MAX_SUBGROUPS   = 16;                     // M
 static constexpr size_t KQUANT_MC_MIN_SUBGROUPS   = 4;                      // fewest waves a multi-column launch uses
 static constexpr size_t KQUANT_MC_STAGE_COL_BYTES = 8 * sizeof(cl_float4);  // one 32-element block of one column
 static constexpr size_t KQUANT_MC_CORESIDENT_WGS  = 2;
-static constexpr int    KQUANT_MC_STAGE_MIN_COLS  = 4;                      // MC_STAGE_MIN_COLS in the kernels
-static constexpr int    Q4K_MC_WAVE_RULE_MIN_COLS = 3;                      // q4_K n2 keeps the power-of-two K-split
+static constexpr int    KQUANT_MC_STAGE_MIN_COLS  = 4;                      // MC_STAGE_MIN_COLS in the q5_K/q6_K kernels
+static constexpr int    Q4K_MC_STAGE_MIN_COLS     = KQUANT_MC_GEMV_MIN_COLS; // the q4_K mc kernel stages at every width
 static constexpr size_t Q5K_Q6K_GEMV_SUBGROUPS    = 4;                      // NSUBGROUPS of the 1-column q5_K/q6_K GEMVs
 
 // Largest ne1 that takes the multi-column GEMV by default (1 = never).
@@ -1906,9 +1906,9 @@ static void create_kquant_mc_gemv_kernels(ggml_backend_opencl_context * backend_
     }
 }
 
-// Below KQUANT_MC_STAGE_MIN_COLS the kernel never touches its stage, which gets the smallest valid (non-zero) size.
-static size_t kquant_mc_stage_bytes(size_t nsg, int ne1) {
-    return ne1 >= KQUANT_MC_STAGE_MIN_COLS ? nsg * (size_t) ne1 * KQUANT_MC_STAGE_COL_BYTES : sizeof(cl_float4);
+// Below stage_min_cols the kernel never touches its stage, which gets the smallest valid (non-zero) size.
+static size_t kquant_mc_stage_bytes(size_t nsg, int ne1, int stage_min_cols) {
+    return ne1 >= stage_min_cols ? nsg * (size_t) ne1 * KQUANT_MC_STAGE_COL_BYTES : sizeof(cl_float4);
 }
 
 // Waves of one K-quant mc launch resident on a compute unit: as many work-groups of nsg subgroups as the kernel's
@@ -21931,10 +21931,10 @@ static void ggml_cl_mul_mat_q4_k_f32_adreno(ggml_backend_t backend, const ggml_t
             while (nsg_y > 4 && 64 * nsg_y > maxwg) { nsg_y >>= 1; }
         }
         if (use_mc) {
-            if (splitk_wide && ne1 >= Q4K_MC_WAVE_RULE_MIN_COLS) {
+            if (splitk_wide) {
                 nsg_y = kquant_mc_subgroups(backend_ctx, kernel, ne01, nsg_y);
             }
-            CL_CHECK(clSetKernelArg(kernel, 12, kquant_mc_stage_bytes(nsg_y, ne1), NULL));
+            CL_CHECK(clSetKernelArg(kernel, 12, kquant_mc_stage_bytes(nsg_y, ne1, Q4K_MC_STAGE_MIN_COLS), NULL));
         }
         size_t local_work_size[3] = {64, nsg_y, 1};
         size_t global_work_size[3] = {(size_t)CEIL_DIV(use_tiled ? ne01 : (use_q4k_o4 ? ne01/4 : ne01/2), 64)*64, nsg_y, 1};
@@ -22329,9 +22329,9 @@ static void ggml_cl_mul_mat_q6_K_f32_adreno(ggml_backend_t backend, const ggml_t
                                  ? (size_t) CEIL_DIV(ne01/4, 64) * 64
                                  : (size_t) CEIL_DIV(ne01/2, 64) * 64;
         size_t nsg = Q5K_Q6K_GEMV_SUBGROUPS;
-        if (use_mc) {  // unlike q4_K, every mc width takes the wave rule
+        if (use_mc) {  // every mc width takes the wave rule
             nsg = kquant_mc_subgroups(backend_ctx, kernel, ne01, nsg);
-            CL_CHECK(clSetKernelArg(kernel, 9, kquant_mc_stage_bytes(nsg, ne1), NULL));
+            CL_CHECK(clSetKernelArg(kernel, 9, kquant_mc_stage_bytes(nsg, ne1, KQUANT_MC_STAGE_MIN_COLS), NULL));
         }
         size_t local_work_size[3]  = {64, nsg, 1};
         size_t global_work_size[3] = {gws_x, nsg, 1};
@@ -22658,9 +22658,9 @@ static void ggml_cl_mul_mat_q5_K_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_uchar), &mask_hi2));
 
         size_t nsg = Q5K_Q6K_GEMV_SUBGROUPS;
-        if (use_mc) {  // unlike q4_K, every mc width takes the wave rule
+        if (use_mc) {  // every mc width takes the wave rule
             nsg = kquant_mc_subgroups(backend_ctx, kernel, ne01, nsg);
-            CL_CHECK(clSetKernelArg(kernel, 13, kquant_mc_stage_bytes(nsg, ne1), NULL));
+            CL_CHECK(clSetKernelArg(kernel, 13, kquant_mc_stage_bytes(nsg, ne1, KQUANT_MC_STAGE_MIN_COLS), NULL));
         }
         size_t local_work_size[3]  = {64, nsg, 1};
         size_t global_work_size[3] = {(size_t)CEIL_DIV(ne01/2, 64)*64, nsg, 1};
