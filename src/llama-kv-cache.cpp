@@ -1365,6 +1365,12 @@ ggml_tensor * llama_kv_cache::get_k_storage(int32_t il) const {
     return layers[ikv].k;
 }
 
+ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
+    const int32_t ikv = map_layer_ids.at(il);
+
+    return layers[ikv].v;
+}
+
 const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
@@ -1422,7 +1428,28 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     return get_k(ctx, il, n_kv, sinfo, 0, sinfo.n_stream());
 }
 
-ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t i0, uint32_t n) const {
+ggml_tensor * llama_kv_cache::get_k_packed(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    const auto runs = sinfo.runs();
+    if (runs.size() == 1) {
+        return get_k(ctx, il, n_kv, sinfo);
+    }
+
+    const uint32_t stream_stride = sinfo.stream_stride();
+    if (stream_stride > 0) {
+        return get_k(ctx, il, n_kv, sinfo, 0, sinfo.n_stream(), stream_stride);
+    }
+
+    ggml_tensor * res = nullptr;
+    for (uint32_t i = 0; i < sinfo.n_stream(); ++i) {
+        ggml_tensor * view = get_k(ctx, il, n_kv, sinfo, i, 1);
+        res = res ? ggml_concat(ctx, res, view, 3) : view;
+    }
+
+    return res;
+}
+
+ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo,
+        uint32_t i0, uint32_t n, uint32_t stream_stride) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
@@ -1436,14 +1463,15 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint32_t ns = n;
 
     for (uint32_t i = 1; i < n; ++i) {
-        GGML_ASSERT(sinfo.strm[i0 + i] == (llama_seq_id) (s0 + i) && "streams of a view must be consecutive");
+        GGML_ASSERT(sinfo.strm[i0 + i] == (llama_seq_id) (s0 + i*stream_stride) &&
+                "streams of a view must have a constant positive stride");
     }
 
     return ggml_view_4d(ctx, k,
             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
             ggml_row_size(k->type, n_embd_k_gqa),
-            ggml_row_size(k->type, n_embd_k_gqa*kv_size),
+            ggml_row_size(k->type, n_embd_k_gqa*kv_size)*stream_stride,
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*s0);
 }
 
@@ -1451,7 +1479,29 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     return get_v(ctx, il, n_kv, sinfo, 0, sinfo.n_stream());
 }
 
-ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t i0, uint32_t n) const {
+llama_kv_cache_packed_view llama_kv_cache::get_v_packed(
+        ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    const auto runs = sinfo.runs();
+    if (runs.size() == 1) {
+        return { get_v(ctx, il, n_kv, sinfo), v_trans };
+    }
+
+    const uint32_t stream_stride = sinfo.stream_stride();
+    if (stream_stride > 0) {
+        return { get_v(ctx, il, n_kv, sinfo, 0, sinfo.n_stream(), stream_stride), v_trans };
+    }
+
+    ggml_tensor * res = nullptr;
+    for (uint32_t i = 0; i < sinfo.n_stream(); ++i) {
+        ggml_tensor * view = get_v(ctx, il, n_kv, sinfo, i, 1);
+        res = res ? ggml_concat(ctx, res, view, 3) : view;
+    }
+
+    return { res, v_trans };
+}
+
+ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo,
+        uint32_t i0, uint32_t n, uint32_t stream_stride) const {
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
@@ -1466,7 +1516,8 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
     const uint32_t ns = n;
 
     for (uint32_t i = 1; i < n; ++i) {
-        GGML_ASSERT(sinfo.strm[i0 + i] == (llama_seq_id) (s0 + i) && "streams of a view must be consecutive");
+        GGML_ASSERT(sinfo.strm[i0 + i] == (llama_seq_id) (s0 + i*stream_stride) &&
+                "streams of a view must have a constant positive stride");
     }
 
     if (!v_trans) {
@@ -1475,7 +1526,7 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
                 hparams.n_embd_head_v(il), hparams.n_head_kv(il), n_kv, ns,
                 ggml_row_size(v->type, hparams.n_embd_head_v(il)),          // v->nb[1]
                 ggml_row_size(v->type, n_embd_v_gqa),                   // v->nb[2]
-                ggml_row_size(v->type, n_embd_v_gqa*kv_size),           // v->nb[3]
+                ggml_row_size(v->type, n_embd_v_gqa*kv_size)*stream_stride, // v->nb[3]
                 ggml_row_size(v->type, n_embd_v_gqa*kv_size)*s0);
     }
 
@@ -1484,8 +1535,13 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
             n_kv, hparams.n_head_kv(il), hparams.n_embd_head_v(il), ns,
             ggml_row_size(v->type, kv_size*hparams.n_embd_head_v(il)),  // v->nb[1]
             ggml_row_size(v->type, kv_size),                        // v->nb[2]
-            ggml_row_size(v->type, kv_size*n_embd_v_gqa),           // v->nb[3]
+            ggml_row_size(v->type, kv_size*n_embd_v_gqa)*stream_stride, // v->nb[3]
             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*s0);
+}
+
+llama_kv_cache_packed_view llama_kv_cache::get_v_view(
+        ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo, uint32_t i0, uint32_t n) const {
+    return { get_v(ctx, il, n_kv, sinfo, i0, n), v_trans };
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
@@ -2990,6 +3046,10 @@ ggml_tensor * llama_kv_cache_context::get_k_storage(int32_t il) const {
     return kv->get_k_storage(il);
 }
 
+ggml_tensor * llama_kv_cache_context::get_v_storage(int32_t il) const {
+    return kv->get_v_storage(il);
+}
+
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
 }
@@ -3003,6 +3063,11 @@ void llama_kv_cache_context::get_run(uint32_t r, uint32_t & i0, uint32_t & n) co
 
     i0 = runs.at(r).first;
     n  = runs.at(r).second;
+}
+
+bool llama_kv_cache_context::get_can_view_packed() const {
+    const auto & sinfo = sinfos[i_cur];
+    return sinfo.runs().size() == 1 || sinfo.stream_stride() > 0;
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il, uint32_t r) const {
@@ -3019,6 +3084,22 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il, uint
     get_run(r, i0, n);
 
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur], i0, n);
+}
+
+llama_kv_cache_packed_view llama_kv_cache_context::get_v_view(ggml_context * ctx, int32_t il, uint32_t r) const {
+    uint32_t i0;
+    uint32_t n;
+    get_run(r, i0, n);
+
+    return kv->get_v_view(ctx, il, n_kv, sinfos[i_cur], i0, n);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_packed(ggml_context * ctx, int32_t il) const {
+    return kv->get_k_packed(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+llama_kv_cache_packed_view llama_kv_cache_context::get_v_packed(ggml_context * ctx, int32_t il) const {
+    return kv->get_v_packed(ctx, il, n_kv, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
