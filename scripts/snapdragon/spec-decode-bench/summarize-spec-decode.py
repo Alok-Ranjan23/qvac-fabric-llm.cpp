@@ -2,12 +2,13 @@
 import argparse
 import json
 from collections import defaultdict
-from statistics import mean
+from statistics import mean, median
 
 CONFIG_ORDER = ["nospec", "mtp1", "mtp3", "mtp7"]
 CONFIG_LABEL = {"nospec": "no spec", "mtp1": "MTP n_max 1", "mtp3": "MTP n_max 3", "mtp7": "MTP n_max 7"}
 NO_SPEC = "nospec"
 THROTTLED_PWRLEVEL = 3
+THROTTLED_TPS_FRACTION = 0.7
 HEADER = ("| Model | Decode | {a} (tok/s) | {b} (tok/s) | {b}/{a} | {a} vs its no-spec | {b} vs its no-spec "
           "| Accepted / drafted ({a}) | Accepted / drafted ({b}) | Clean samples ({a}/{b}) | Throttled samples ({a}/{b}) |")
 SEPARATOR = "|---|---|---|---|---|---|---|---|---|---|---|"
@@ -28,13 +29,20 @@ def group_cells(rows):
     return cells
 
 
-def is_throttled(r):
+def is_throttled(r, cell_median):
     return (r["thermal_before"]["gpu_pwrlevel"] >= THROTTLED_PWRLEVEL
-            or r["thermal_after"]["gpu_pwrlevel"] >= THROTTLED_PWRLEVEL)
+            or r["thermal_after"]["gpu_pwrlevel"] >= THROTTLED_PWRLEVEL
+            or r.get("gpu_pwrlevel_max", 0) >= THROTTLED_PWRLEVEL
+            or r["decode_tps"] < THROTTLED_TPS_FRACTION * cell_median)
+
+
+def clean_samples(rs):
+    cell_median = median(r["decode_tps"] for r in rs)
+    return [r for r in rs if not is_throttled(r, cell_median)]
 
 
 def cell_stats(rs):
-    clean = [r for r in rs or [] if not is_throttled(r)]
+    clean = clean_samples(rs) if rs else []
     if not clean:
         return None
     tps = [r["decode_tps"] for r in clean]

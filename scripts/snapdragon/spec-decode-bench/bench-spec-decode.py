@@ -3,6 +3,7 @@ import argparse
 import json
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -30,6 +31,7 @@ COOL_MAX_GPU_TEMP_C = 48.0
 BETWEEN_LAUNCH_S = 5
 OTHER_BENCH_POLL_S = 60
 SERVER_START_TIMEOUT_S = 20
+PWR_POLL_S = 2
 
 CONFIGS = {
     "nospec": [],
@@ -76,6 +78,34 @@ def read_thermal(dev):
         "gpu_temp_c": int(parts[2]) / 1000.0,
         "thermal_status": int(parts[3]) if len(parts) > 3 and parts[3] else -1,
     }
+
+
+def read_pwrlevel(dev):
+    return int(dev.shell(f"cat {KGSL}/thermal_pwrlevel").strip())
+
+
+class PwrSampler:
+    def __init__(self, dev):
+        self.dev = dev
+        self.max_pwr = 0
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+
+    def run(self):
+        while not self.stop.is_set():
+            try:
+                self.max_pwr = max(self.max_pwr, read_pwrlevel(self.dev))
+            except Exception:
+                pass
+            self.stop.wait(PWR_POLL_S)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        self.thread.join()
 
 
 def is_cool(t):
@@ -182,16 +212,18 @@ def timings_row(resp):
 
 def print_prompt_result(idx, row, before):
     print(f"    p{idx}: {row['decode_tps']:.2f} tok/s  draft {row['draft_accepted']}/{row['draft_n']}  "
-          f"pwr {before['gpu_pwrlevel']}->{row['thermal_after']['gpu_pwrlevel']}", flush=True)
+          f"pwr {before['gpu_pwrlevel']}->{row['thermal_after']['gpu_pwrlevel']} max {row['gpu_pwrlevel_max']}", flush=True)
 
 
 def run_prompts(ctx, base_row, out):
     for idx, text in enumerate(ctx.prompts):
         wait_for_cool(ctx.dev, ctx.cool_per_prompt)
         before = read_thermal(ctx.dev)
-        resp = run_completion(ctx.dev, render_prompt(ctx.dev, text), ctx.n_predict)
+        prompt = render_prompt(ctx.dev, text)
+        with PwrSampler(ctx.dev) as sampler:
+            resp = run_completion(ctx.dev, prompt, ctx.n_predict)
         row = {**base_row, "prompt_idx": idx, "thermal_before": before,
-               "thermal_after": read_thermal(ctx.dev), **timings_row(resp)}
+               "thermal_after": read_thermal(ctx.dev), "gpu_pwrlevel_max": sampler.max_pwr, **timings_row(resp)}
         out.write(json.dumps(row) + "\n")
         out.flush()
         print_prompt_result(idx, row, before)
