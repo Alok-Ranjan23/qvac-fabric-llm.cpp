@@ -30,4 +30,4 @@ python3 scripts/snapdragon/spec-decode-bench/summarize-spec-decode.py spec-decod
 
 Server settings follow the Adreno MTP measurements: `-ngl 99 -c 4096 -np 1 --no-cache-prompt`, three prompts rendered through `/apply-template`, 256 generated tokens at temperature 0, `--spec-type draft-mtp --spec-draft-n-max N` for the MTP rows. `--env KEY=VALUE,...` exports backend switches such as `GGML_OPENCL_KQUANT_MC_GEMV=1` to the server. `--wait-for-process PATTERN` holds the run while another benchmark matching the pattern is active on the host or the phone. `--no-cool-gate` reproduces uncontrolled back-to-back runs.
 
-Every prompt writes one JSON line with the server timings (`predicted_per_second`, `draft_n`, `draft_n_accepted`), the thermal state before and after, the load time and the cool-down wait.
+Every prompt writes one JSON line with the server timings (`predicted_per_second`, `draft_n`, `draft_n_accepted`), the thermal state before and after, the load time and the cool-down wait. The summary averages only the prompts that stayed below kgsl `thermal_pwrlevel` 3 before and after, and reports how many prompts per cell were throttled.
