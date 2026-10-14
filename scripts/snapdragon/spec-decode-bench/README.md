@@ -2,7 +2,7 @@
 
 `bench-spec-decode.py` runs `llama-server` builds on an adb-attached phone and measures the decode rate with and without MTP speculative decoding. `summarize-spec-decode.py` turns the results into the Markdown table used in PR descriptions.
 
-Two builds are compared in the same session, ABBA-interleaved per row with the order flipped every row, so the GPU thermal drift hits both builds the same way. Each launch waits for the phone to cool (thermal service status 0, kgsl `thermal_pwrlevel` at most 2, GPU below 48 C) before the server starts, and records the thermal state around every prompt.
+Two builds are compared in the same session, ABBA-interleaved per row with the order flipped every row, so the GPU thermal drift hits both builds the same way. Each launch waits for the phone to cool (thermal service status 0, kgsl `thermal_pwrlevel` at most 2, GPU below 48 C, skin sensor below 36.5 C) before the server starts, and records the thermal state around every prompt.
 
 ## Device layout
 

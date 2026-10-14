@@ -28,6 +28,7 @@ COOL_POLL_S = 15
 COOL_SETTLE_S = 20
 COOL_MAX_PWRLEVEL = 2
 COOL_MAX_GPU_TEMP_C = 48.0
+COOL_MAX_SKIN_C = 36.5
 BETWEEN_LAUNCH_S = 5
 OTHER_BENCH_POLL_S = 60
 SERVER_START_TIMEOUT_S = 20
@@ -70,13 +71,15 @@ def sh(args, timeout=None, check=True):
 
 def read_thermal(dev):
     raw = dev.shell(f"cat {KGSL}/thermal_pwrlevel {KGSL}/max_gpuclk {KGSL}/temp; "
-                    "dumpsys thermalservice | grep -m1 'Thermal Status' | tr -dc '0-9'")
+                    "dumpsys thermalservice | grep -m1 'Thermal Status' | tr -dc '0-9'; echo; "
+                    "dumpsys thermalservice | grep -m1 'mName=SKIN' | sed 's/.*mValue=\\([0-9.]*\\).*/\\1/'")
     parts = raw.split()
     return {
         "gpu_pwrlevel": int(parts[0]),
         "gpu_max_clk_mhz": int(parts[1]) // 1_000_000,
         "gpu_temp_c": int(parts[2]) / 1000.0,
         "thermal_status": int(parts[3]) if len(parts) > 3 and parts[3] else -1,
+        "skin_temp_c": float(parts[4]) if len(parts) > 4 else -1.0,
     }
 
 
@@ -111,7 +114,8 @@ class PwrSampler:
 def is_cool(t):
     return (t["thermal_status"] == 0
             and t["gpu_pwrlevel"] <= COOL_MAX_PWRLEVEL
-            and t["gpu_temp_c"] <= COOL_MAX_GPU_TEMP_C)
+            and t["gpu_temp_c"] <= COOL_MAX_GPU_TEMP_C
+            and t["skin_temp_c"] <= COOL_MAX_SKIN_C)
 
 
 def wait_for_cool(dev, enabled):
@@ -233,7 +237,7 @@ def run_cell(ctx, build, model, cfg_name, pass_idx, out):
     log_name = f"{build}-{model}-{cfg_name}-p{pass_idx}"
     cool_wait, thermal = wait_for_cool(ctx.dev, ctx.cool_gate)
     print(f"  [{build} {model} {cfg_name} pass {pass_idx}] cooled {cool_wait}s, "
-          f"pwr {thermal['gpu_pwrlevel']} temp {thermal['gpu_temp_c']:.1f}C", flush=True)
+          f"pwr {thermal['gpu_pwrlevel']} temp {thermal['gpu_temp_c']:.1f}C skin {thermal['skin_temp_c']:.1f}C", flush=True)
     start_server(ctx.dev, ctx.builds[build], ctx.models[model], ctx.server_args, CONFIGS[cfg_name], log_name, ctx.env)
     load_s = wait_for_health(ctx.dev, log_name)
     base_row = {"build": build, "model": model, "config": cfg_name, "pass": pass_idx,
