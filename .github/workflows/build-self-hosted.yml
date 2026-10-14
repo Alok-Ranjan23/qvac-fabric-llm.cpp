@@ -1,589 +1,76 @@
 name: CI (self-hosted)
+run-name: CM2 matched base/head comparison for fabric PR 389
 
 on:
-  workflow_dispatch: # allows manual triggering
-  push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/build-self-hosted.yml',
-      'ci/run.sh',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp',
-      '**/*.cu',
-      '**/*.cuh',
-      '**/*.swift',
-      '**/*.m',
-      '**/*.metal',
-      '**/*.comp',
-      '**/*.glsl',
-      '**/*.wgsl'
-    ]
+  workflow_dispatch:
 
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/build-self-hosted.yml',
-      'ci/run.sh',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp',
-      '**/*.cu',
-      '**/*.cuh',
-      '**/*.swift',
-      '**/*.m',
-      '**/*.metal',
-      '**/*.comp',
-      '**/*.glsl',
-      '**/*.wgsl'
-    ]
-
-# QVAC divergence from upstream: dedupe per PR and per branch, so a re-push or
-# re-dispatch supersedes the in-flight run. The default branch deliberately
-# keeps upstream's run_id behaviour — master pushes must not cancel each other,
-# or a merged commit can end with no CI verdict. See QVAC-24627.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || (github.ref == 'refs/heads/master' && github.run_id) || github.ref }}
-  cancel-in-progress: true
-
-env:
-  # note: this is dud token to avoid rate limiting (https://github.com/ggml-org/llama.cpp/pull/25706#issuecomment-4979941302)
-  HF_TOKEN: ${{ secrets.HF_TOKEN_CI }}
-  GGML_NLOOP: 3
-  GGML_N_THREADS: 1
-  LLAMA_ARG_LOG_COLORS: 1
-  LLAMA_ARG_LOG_PREFIX: 1
-  LLAMA_ARG_LOG_TIMESTAMPS: 1
+permissions:
+  contents: read
 
 jobs:
   authorize:
     permissions: {}
     uses: ./.github/workflows/reusable-authorize-self-hosted.yml
 
-  gpu-cuda:
+  cm2-base-head:
     needs: authorize
     if: needs.authorize.outputs.allowed == 'true'
-    # runs-on: "hf-jobs-t4-small:cuda13"
     runs-on: qvac-ubuntu2204-x64-gpu
-
+    timeout-minutes: 30
+    env:
+      GGML_N_THREADS: 1
+      GGML_NLOOP: 3
+      CM2_CORPUS_COUNT: 1024
     steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      # No `sudo apt install` step: the self-hosted runners are de-sudoed, and these
-      # packages are already provisioned fleet-wide on the runners.
-      - name: ccache
-        uses: ggml-org/ccache-action@v1.2.24
-        with:
-          restore: false
-          save: false
-
-      - name: ccache-buckets-restore
-        uses: ./.github/actions/ccache-buckets
-        with:
-          key: self-hosted-gpu-cuda
-          folder: llama.cpp
-          hf_bucket: ggml-org/cache
-
-      - name: Test
-        id: ggml-ci
-        run: |
-          git lfs install
-          nvidia-smi
-          GG_BUILD_CUDA=1 CUDACXX=/usr/local/cuda/bin/nvcc bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
-
-      - name: ccache-buckets-save
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-        uses: ./.github/actions/ccache-buckets
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN_CACHE_OUTPUT }}
-        with:
-          key: self-hosted-gpu-cuda
-          folder: llama.cpp
-          evict-old-files: 1d
-          hf_bucket: ggml-org/cache
-          save: true
-
-  gpu-rocm:
-    if: false  # QVAC-23796: no matching hardware
-    runs-on: [self-hosted, Linux, AMD]
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      - name: Test
-        id: ggml-ci
-        # HIP_LAUNCH_BLOCKING=1: workaround for an async-execution correctness
-        # issue on integrated RDNA3.5 (gfx1151) where batched inference returns
-        # incorrect output (perplexity ~88 vs ~9.4). Serializing kernel launches
-        # restores correctness. Remove once the underlying ROCm/HIP issue is fixed.
-        env:
-          HIP_LAUNCH_BLOCKING: "1"
-        run: |
-          git lfs install
-          rocminfo
-          GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS=gfx1151 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
-
-  gpu-vulkan-nvidia-cm:
-    needs: authorize
-    if: needs.authorize.outputs.allowed == 'true'
-    # runs-on: "hf-jobs-t4-small:ubuntu26_04"
-    runs-on: qvac-ubuntu2204-x64-gpu
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      # - name: Install dependencies
-      #   run: |
-      #     sudo apt update
-      #     sudo apt install -y build-essential cmake libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev libvulkan-dev glslc spirv-headers vulkan-tools mesa-vulkan-drivers libglvnd0 libgl1 libglx0 libegl1 libgles2 libssl-dev time unzip wget python3 python3-venv python3-pip
-
-      # - name: ccache
-      #   uses: ggml-org/ccache-action@v1.2.24
-      #   with:
-      #     restore: false
-      #     save: false
-
-      # - name: ccache-buckets-restore
-      #   uses: ./.github/actions/ccache-buckets
-      #   with:
-      #     key: self-hosted-vulkan-nvidia-cm
-      #     folder: llama.cpp
-      #     hf_bucket: ggml-org/cache
-
-      - name: Test
-        id: ggml-ci
-        run: |
-          git lfs install
-          vulkaninfo --summary
-          GG_BUILD_VULKAN=1 GGML_VK_DISABLE_COOPMAT2=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
-
-      # - name: ccache-buckets-save
-      #   if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-      #   uses: ./.github/actions/ccache-buckets
-      #   env:
-      #     HF_TOKEN: ${{ secrets.HF_TOKEN_CACHE_OUTPUT }}
-      #   with:
-      #     key: self-hosted-vulkan-nvidia-cm
-      #     folder: llama.cpp
-      #     evict-old-files: 1d
-      #     hf_bucket: ggml-org/cache
-      #     save: true
-
-  gpu-vulkan-nvidia-cm2:
-    needs: authorize
-    if: needs.authorize.outputs.allowed == 'true'
-    # runs-on: "hf-jobs-t4-small:ubuntu26_04"
-    runs-on: qvac-ubuntu2204-x64-gpu
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      # - name: Install dependencies
-      #   run: |
-      #     sudo apt update
-      #     sudo apt install -y build-essential cmake libxcb-xinput0 libxcb-xinerama0 libxcb-cursor-dev libvulkan-dev glslc spirv-headers vulkan-tools mesa-vulkan-drivers libglvnd0 libgl1 libglx0 libegl1 libgles2 libssl-dev time unzip wget python3 python3-venv python3-pip
-
-      # - name: ccache
-      #   uses: ggml-org/ccache-action@v1.2.24
-      #   with:
-      #     restore: false
-      #     save: false
-
-      # - name: ccache-buckets-restore
-      #   uses: ./.github/actions/ccache-buckets
-      #   with:
-      #     key: self-hosted-vulkan-nvidia-cm2
-      #     folder: llama.cpp
-      #     hf_bucket: ggml-org/cache
-
-      - name: Test
-        id: ggml-ci
-        run: |
-          git lfs install
-          vulkaninfo --summary
-          GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
-
-      # - name: ccache-buckets-save
-      #   if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-      #   uses: ./.github/actions/ccache-buckets
-      #   env:
-      #     HF_TOKEN: ${{ secrets.HF_TOKEN_CACHE_OUTPUT }}
-      #   with:
-      #     key: self-hosted-vulkan-nvidia-cm2
-      #     folder: llama.cpp
-      #     evict-old-files: 1d
-      #     hf_bucket: ggml-org/cache
-      #     save: true
-
-  gpu-webgpu-nvidia:
-    needs: authorize
-    if: needs.authorize.outputs.allowed == 'true'
-    # runs-on: "hf-jobs-t4-small:ubuntu26_04"
-    runs-on: qvac-ubuntu2404-x64-gpu
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      # No `sudo apt install` step: the self-hosted runners are de-sudoed, and these
-      # packages are already provisioned fleet-wide on the runners.
-      - name: ccache
-        uses: ggml-org/ccache-action@v1.2.24
-        with:
-          restore: false
-          save: false
-
-      - name: ccache-buckets-restore
-        uses: ./.github/actions/ccache-buckets
-        with:
-          key: self-hosted-webgpu-nvidia
-          folder: llama.cpp
-          hf_bucket: ggml-org/cache
-
-      - name: Dawn Dependency
-        id: dawn-depends
-        run: |
-          DAWN_VERSION="v20260908.214631"
-          DAWN_OWNER="google"
-          DAWN_REPO="dawn"
-          DAWN_ASSET_NAME="Dawn-94c3c9cc0d5fb2e85aebb370fa8d37b71aa34655-ubuntu-latest-Release"
-          echo "Fetching release asset from https://github.com/google/dawn/releases/download/${DAWN_VERSION}/${DAWN_ASSET_NAME}.tar.gz"
-          curl -L -o artifact.tar.gz \
-            "https://github.com/google/dawn/releases/download/${DAWN_VERSION}/${DAWN_ASSET_NAME}.tar.gz"
-          mkdir dawn
-          tar -xvf artifact.tar.gz -C dawn --strip-components=1
-
-      - name: Test
-        id: ggml-ci
-        run: |
-          git lfs install
-          GG_BUILD_WEBGPU=1 \
-          GG_BUILD_WEBGPU_DAWN_PREFIX="$GITHUB_WORKSPACE/dawn" \
-          GG_BUILD_WEBGPU_DAWN_DIR="$GITHUB_WORKSPACE/dawn/lib64/cmake/Dawn" \
-            bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
-
-      - name: ccache-buckets-save
-        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-        uses: ./.github/actions/ccache-buckets
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN_CACHE_OUTPUT }}
-        with:
-          key: self-hosted-webgpu-nvidia
-          folder: llama.cpp
-          evict-old-files: 1d
-          hf_bucket: ggml-org/cache
-          save: true
-
-  # TODO: provision AMX-compatible machine
-  #cpu-amx:
-  #  needs: authorize
-  #  if: needs.authorize.outputs.allowed == 'true'
-  #  runs-on: [self-hosted, Linux, CPU, AMX]
-
-  #  steps:
-  #    - name: Clone
-  #      id: checkout
-  #      uses: actions/checkout@v6
-
-  #    - name: Test
-  #      id: ggml-ci
-  #      run: |
-  #        bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
-
-  # TODO: provision AMD GPU machine
-  # amd-vulkan:
-  #   needs: authorize
-  #   if: needs.authorize.outputs.allowed == 'true'
-  #   runs-on: [self-hosted, Linux, AMD]
-
-  #   steps:
-  #     - name: Clone
-  #       id: checkout
-  #       uses: actions/checkout@v6
-
-  #     - name: Test
-  #       id: ggml-ci
-  #       run: |
-  #         vulkaninfo --summary
-  #         GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
-
-  # TODO: provision AMD GPU machine
-  # amd-rocm:
-  #   needs: authorize
-  #   if: needs.authorize.outputs.allowed == 'true'
-  #   runs-on: [self-hosted, Linux, AMD]
-
-  #   steps:
-  #     - name: Clone
-  #       id: checkout
-  #       uses: actions/checkout@v6
-
-  #     - name: Test
-  #       id: ggml-ci
-  #       run: |
-  #         amd-smi static
-  #         GG_BUILD_ROCM=1 GG_BUILD_AMDGPU_TARGETS="gfx1101" bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
-
-  gpu-metal:
-    needs: authorize
-    if: needs.authorize.outputs.allowed == 'true'
-    runs-on: qvac-macos26-arm64-gpu
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      - name: Test
-        id: ggml-ci
-        run: |
-          git lfs install
-          GG_BUILD_METAL=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
-
-  gpu-webgpu-apple:
-    needs: authorize
-    if: needs.authorize.outputs.allowed == 'true'
-    runs-on: qvac-macos26-arm64-gpu
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      - name: Dawn Dependency
-        id: dawn-depends
-        run: |
-          DAWN_VERSION="v20260908.214631"
-          DAWN_OWNER="google"
-          DAWN_REPO="dawn"
-          DAWN_ASSET_NAME="Dawn-94c3c9cc0d5fb2e85aebb370fa8d37b71aa34655-macos-latest-Release"
-          echo "Fetching release asset from https://github.com/google/dawn/releases/download/${DAWN_VERSION}/${DAWN_ASSET_NAME}.tar.gz"
-          curl -L -o artifact.tar.gz \
-            "https://github.com/google/dawn/releases/download/${DAWN_VERSION}/${DAWN_ASSET_NAME}.tar.gz"
-          mkdir dawn
-          tar -xvf artifact.tar.gz -C dawn --strip-components=1
-
-      - name: Test
-        id: ggml-ci
-        run: |
-          git lfs install
-          GG_BUILD_WEBGPU=1 GG_BUILD_WEBGPU_DAWN_PREFIX="$GITHUB_WORKSPACE/dawn" \
-            bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
-
-  gpu-vulkan-apple:
-    needs: authorize
-    if: needs.authorize.outputs.allowed == 'true'
-    runs-on: qvac-macos26-arm64-gpu
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      - name: Test
-        id: ggml-ci
-        run: |
-          git lfs install
-          vulkaninfo --summary
-          GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
-
-  gpu-vulkan-intel-linux:
-    if: false  # QVAC-23796: no matching hardware
-    runs-on: [self-hosted, Linux, Intel]
-
-    steps:
-      - name: Clone
-        id: checkout
+      - name: Diagnostic harness
         uses: actions/checkout@v6
         with:
           persist-credentials: false
-
-      - name: Test
-        id: ggml-ci
-        run: |
-          git lfs install
-          vulkaninfo --summary
-          GG_BUILD_VULKAN=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
-
-  gpu-vulkan-intel-windows:
-    if: false  # QVAC-23796: no matching hardware
-    runs-on: [self-hosted, Windows, X64, Intel]
-
-    steps:
-      - name: Clone
-        id: checkout
+      - name: Exact PR base
         uses: actions/checkout@v6
-
-      - name: Test
-        id: ggml-ci
-        shell: C:\msys64\usr\bin\bash.exe --noprofile --norc -eo pipefail "{0}"
-        env:
-          MSYSTEM: UCRT64
-          CHERE_INVOKING: 1
-          PATH: C:\msys64\ucrt64\bin;C:\msys64\usr\bin;C:\Windows\System32;${{ env.PATH }}
-        run: |
-          git lfs install
-          vulkaninfo --summary
-          # Skip python related tests with GG_BUILD_LOW_PERF=1 since Windows MSYS2 UCRT64 currently fails to create
-          # a valid python environment for testing
-          LLAMA_FATAL_WARNINGS=OFF GG_BUILD_NINJA=1 GG_BUILD_VULKAN=1 GG_BUILD_LOW_PERF=1 ./ci/run.sh ./results/llama.cpp ./mnt/llama.cpp
-
-  gpu-openvino-low-perf:
-    if: false  # QVAC-23796: no matching hardware
-    runs-on: [self-hosted, Linux, Intel, OpenVINO]
-
-    env:
-      # Sync versions in build.yml, build-self-hosted.yml, release.yml, build-cache.yml, .devops/openvino.Dockerfile
-      OPENVINO_VERSION_MAJOR: "2026.3.1"
-      OPENVINO_VERSION_FULL: "2026.3.1.22476.56d9685302d"
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      - name: Setup OpenVINO Toolkit
-        uses: ./.github/actions/linux-setup-openvino
         with:
-          path: ./openvino_toolkit
-          version_major: ${{ env.OPENVINO_VERSION_MAJOR }}
-          version_full: ${{ env.OPENVINO_VERSION_FULL }}
-
-      - name: Install OpenVINO dependencies
-        run: |
-          cd ./openvino_toolkit
-          chmod +x ./install_dependencies/install_openvino_dependencies.sh
-          echo "Y" | sudo -E ./install_dependencies/install_openvino_dependencies.sh
-
-      - name: Test
-        id: ggml-ci
-        run: |
-          git lfs install
-          source ./openvino_toolkit/setupvars.sh
-          GG_BUILD_OPENVINO=1 GGML_OPENVINO_DEVICE=GPU GG_BUILD_LOW_PERF=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
-
-  cpu-x64-high-perf:
-    needs: authorize
-    if: needs.authorize.outputs.allowed == 'true'
-    runs-on: qvac-ubuntu2204-x64
-
-    steps:
-      - name: Clone
-        id: checkout
+          ref: f5ddcebbddb0bf1c87b60e5ca81c720d1c5cd5af
+          path: base
+          persist-credentials: false
+      - name: Exact PR head
         uses: actions/checkout@v6
-
-      - name: Test
-        id: ggml-ci
+        with:
+          ref: 5ceeacf03396914fb805fdc48d8c0c3b6f1a934d
+          fetch-depth: 2
+          path: head
+          persist-credentials: false
+      - name: Verify inputs and capture runner environment
         run: |
-          git lfs install
-          LLAMA_ARG_THREADS=$(nproc) GG_BUILD_HIGH_PERF=1 GG_BUILD_EXTRA_TESTS_0=1 bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
-
-  cpu-arm64-high-perf-graviton4:
-    if: false  # QVAC-23796: no matching hardware
-    runs-on: ah-ubuntu_24_04-c8g_8x
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      - name: Dependencies
-        id: depends
+          mkdir -p cm2-results
+          test "$(git -C base rev-parse HEAD)" = f5ddcebbddb0bf1c87b60e5ca81c720d1c5cd5af
+          test "$(git -C head rev-parse HEAD)" = 5ceeacf03396914fb805fdc48d8c0c3b6f1a934d
+          cmp base/tests/test-backend-ops.cpp head/tests/test-backend-ops.cpp
+          cmp base/ci/run.sh head/ci/run.sh
+          git -C head diff f5ddcebbddb0bf1c87b60e5ca81c720d1c5cd5af -- ggml/src/ggml-vulkan ggml/src/ggml-quants.c ggml/src/ggml-cpu > cm2-results/kernel-diff.txt
+          test ! -s cm2-results/kernel-diff.txt
+          uname -a > cm2-results/environment.txt
+          c++ --version >> cm2-results/environment.txt
+          cmake --version >> cm2-results/environment.txt
+          glslc --version >> cm2-results/environment.txt
+          nvidia-smi >> cm2-results/environment.txt
+          vulkaninfo --summary >> cm2-results/environment.txt
+          python3 diagnostics/cm2/patch_test.py base
+          python3 diagnostics/cm2/patch_test.py head
+          cmp base/tests/test-backend-ops.cpp head/tests/test-backend-ops.cpp
+          sha256sum base/tests/test-backend-ops.cpp head/tests/test-backend-ops.cpp > cm2-results/harness-sha256.txt
+      - name: Build both revisions with the CI Release configuration
         run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
-          apt-get install -y \
-          build-essential \
-          coreutils \
-          python3-venv \
-          gpg \
-          wget \
-          time \
-          git-lfs
-
-          git lfs install
-
-          # install the latest cmake
-          sudo install -d /usr/share/keyrings
-          wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc \
-            | gpg --dearmor \
-            | sudo tee /usr/share/keyrings/kitware-archive-keyring.gpg >/dev/null
-          echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ jammy main' \
-            | sudo tee /etc/apt/sources.list.d/kitware.list
-          sudo apt-get update
-          sudo apt-get install -y cmake
-
-          command -v nproc
-
-      - name: Test
-        id: ggml-ci
-        run: |
-          LLAMA_ARG_THREADS=$(nproc) \
-          GG_BUILD_HIGH_PERF=1 \
-          GG_BUILD_NO_BF16=1 \
-          GG_BUILD_EXTRA_TESTS_0=1 \
-          bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
-
-  cpu-arm64-graviton4-kleidiai:
-    if: false  # QVAC-23796: no matching hardware
-    runs-on: ah-ubuntu_24_04-c8g_8x
-
-    steps:
-      - name: Clone
-        id: checkout
-        uses: actions/checkout@v6
-
-      - name: Dependencies
-        id: depends
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
-          apt-get install -y \
-          build-essential \
-          coreutils \
-          python3-venv \
-          gpg \
-          wget \
-          time \
-          git-lfs
-
-          git lfs install
-
-          # install the latest cmake
-          sudo install -d /usr/share/keyrings
-          wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc \
-            | gpg --dearmor \
-            | sudo tee /usr/share/keyrings/kitware-archive-keyring.gpg >/dev/null
-          echo 'deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ jammy main' \
-            | sudo tee /etc/apt/sources.list.d/kitware.list
-          sudo apt-get update
-          sudo apt-get install -y cmake
-
-          command -v nproc
-
-      - name: Test
-        id: ggml-ci
-        run: |
-          LLAMA_ARG_THREADS=$(nproc) \
-          GG_BUILD_KLEIDIAI=1 \
-          GG_BUILD_EXTRA_TESTS_0=1 \
-          GG_BUILD_HIGH_PERF=1 \
-          bash ./ci/run.sh ~/results/llama.cpp ~/mnt/llama.cpp
+          for tree in base head; do
+            cmake -S "$tree" -B "$tree/build-cm2" -G 'Unix Makefiles' -DCMAKE_BUILD_TYPE=Release -DLLAMA_FATAL_WARNINGS=ON -DLLAMA_OPENSSL=OFF -DGGML_SCHED_NO_REALLOC=ON -DGGML_METAL=OFF -DGGML_VULKAN=1 2>&1 | tee "cm2-results/$tree-configure.log"
+            cmake --build "$tree/build-cm2" --config Release --target test-backend-ops -j4 2>&1 | tee "cm2-results/$tree-build.log"
+            cp "$tree/build-cm2/CMakeCache.txt" "cm2-results/$tree-CMakeCache.txt"
+          done
+      - name: Capture original randomized inputs and replay base/head twice
+        run: python3 diagnostics/cm2/compare.py
+      - name: Save comparison evidence including the exact tensor corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fabric-389-cm2-base-head
+          path: cm2-results
+          retention-days: 5
