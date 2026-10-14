@@ -1726,6 +1726,10 @@ extern "C" {
         void * get_opt_pars_ud;                     // userdata for calculating optimizer parameters
 
         enum ggml_opt_optimizer_type optimizer_type;
+
+        // Optional checkpoint loading
+        const char * checkpoint_path;        // path to checkpoint file to load optimizer state from (nullptr = don't load)
+        bool load_optimizer_state;          // whether to load optimizer state from checkpoint_path
     };
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
@@ -1738,7 +1742,33 @@ extern "C" {
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
-    
+
+    LLAMA_API void llama_opt_epoch_resume(
+            struct llama_context    * lctx,
+            ggml_opt_dataset_t        dataset,
+            ggml_opt_result_t         result_train,
+            ggml_opt_result_t         result_eval,
+            int64_t                   idata_split,
+            ggml_opt_epoch_callback   callback_train,
+            ggml_opt_epoch_callback   callback_eval,
+            int64_t                   resume_from_batch);
+
+    // Optimizer state persistence
+    LLAMA_API bool llama_opt_save_state(struct llama_context * lctx, const char * filename);
+    LLAMA_API bool llama_opt_load_state(struct llama_context * lctx, const char * filename);
+
+    // Clean up optimizer context to free memory and allow reinitialization
+    // Call this before calling llama_opt_init() again on the same context
+    LLAMA_API void llama_opt_cleanup(struct llama_context * lctx);
+
+    // Request early exit from training epoch (thread-safe)
+    // Call this from a callback or another thread to stop training after the current batch
+    LLAMA_API void llama_opt_request_stop(struct llama_context * lctx);
+
+    // Reset the stop flag to allow training to continue
+    // Call this before resuming training after a pause
+    LLAMA_API void llama_opt_reset_stop(struct llama_context * lctx);
+
     // LoRA training parameters
     enum llama_lora_target_module {
         LLAMA_LORA_TARGET_ATTN_Q    = 1 << 0,
@@ -1772,10 +1802,19 @@ extern "C" {
     // LoRA parameter filter (returns true for LoRA tensors only)
     LLAMA_API bool llama_opt_param_filter_lora(const struct ggml_tensor * tensor, void * userdata);
 
+    LLAMA_API int64_t llama_opt_get_iter(struct llama_context * ctx);
+
     LLAMA_API bool llama_lora_save_adapter(
         const struct llama_adapter_lora * adapter,
         const char * filename,
         const struct llama_model * model
+    );
+
+    LLAMA_API bool llama_lora_save_checkpoint(
+        const struct llama_adapter_lora * adapter,
+        const char * filename,
+        const struct llama_model * model,
+        struct llama_context * ctx
     );
 
 #ifdef __cplusplus

@@ -3825,6 +3825,16 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
             }
         }
     }
+
+    if (lopt_params.load_optimizer_state && lopt_params.checkpoint_path) {
+        if (opt_load_state(lopt_params.checkpoint_path)) {
+            pending_optimizer_checkpoint_path = lopt_params.checkpoint_path;
+            should_load_optimizer_tensors = true;
+            optimizer_tensors_loaded = false;
+        } else {
+            LLAMA_LOG_ERROR("Failed to load optimizer state from: %s\n", lopt_params.checkpoint_path);
+        }
+    }
 }
 
 void llama_context::opt_epoch_iter(
@@ -3846,6 +3856,10 @@ void llama_context::opt_epoch_iter(
     memory->clear(true);
 
     for (uint32_t pos_ctx = 0; pos_ctx < n_ctx; pos_ctx += n_batch) {
+        // Check for early exit request before processing context batch
+        if (training_should_stop.load(std::memory_order_acquire)) {
+            return;
+        }
         batch.n_tokens = n_batch;
         for (uint32_t pos_batch = 0; pos_batch < n_batch; ++pos_batch) {
             batch.token   [pos_batch]    = tokens[pos_ctx + pos_batch];
@@ -3886,6 +3900,11 @@ void llama_context::opt_epoch_iter(
 
         uint32_t pos_batch = 0;
         do {
+            // Check for early exit request before processing ubatch
+            if (training_should_stop.load(std::memory_order_acquire)) {
+                break;
+            }
+
             const auto & ubatch = mctx->get_ubatch();
 
             n_outputs = ubatch.n_tokens;
@@ -3919,6 +3938,17 @@ void llama_context::opt_epoch_iter(
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             ggml_opt_alloc(opt_ctx, train);
 
+            // Load optimizer tensors on first training iteration if pending
+            if (train && should_load_optimizer_tensors && !optimizer_tensors_loaded) {
+                if (ggml_opt_load_tensors(opt_ctx, pending_optimizer_checkpoint_path.c_str())) {
+                    LLAMA_LOG_INFO("Successfully loaded optimizer state tensor data\n");
+                    optimizer_tensors_loaded = true;
+                } else {
+                    LLAMA_LOG_ERROR("Failed to load optimizer tensor data\n");
+                }
+                should_load_optimizer_tensors = false;  // Only try once
+            }
+
             res->set_inputs(&ubatch);
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
@@ -3939,6 +3969,11 @@ void llama_context::opt_epoch_iter(
             ggml_free(ctx_compute_opt);
 
             pos_batch += ubatch.n_tokens;
+
+            // Check for early exit request after processing ubatch
+            if (training_should_stop.load(std::memory_order_acquire)) {
+                break;
+            }
         } while (mctx->next());
     }
 }
@@ -3949,7 +3984,11 @@ void llama_context::opt_epoch(
         ggml_opt_result_t         result_eval,
         int64_t                   idata_split,
         ggml_opt_epoch_callback   callback_train,
-        ggml_opt_epoch_callback   callback_eval) {
+        ggml_opt_epoch_callback   callback_eval,
+        int64_t                   resume_from_batch) {
+    // Reset stop flag at the start of each epoch to ensure clean state
+    training_should_stop.store(false, std::memory_order_release);
+
     const uint32_t n_ctx    = this->n_ctx();
     const uint32_t n_batch  = std::min(cparams.n_batch,  n_ctx);
     const uint32_t n_ubatch = std::min(cparams.n_ubatch, n_batch);
@@ -3964,31 +4003,90 @@ void llama_context::opt_epoch(
     std::vector<llama_token>        tokens(n_ctx);
     std::vector<llama_token> labels_sparse(n_ctx);
 
-    int64_t idata = 0;
+    int64_t idata = (resume_from_batch >= 0) ? resume_from_batch + 1 : 0;
 
     int64_t t_loop_start = ggml_time_us();
     int64_t ndata_in_loop = idata_split*ubatch_per_ctx;
     for (; idata < idata_split; ++idata) {
+        // Check for early exit request before processing batch
+        if (training_should_stop.load(std::memory_order_acquire)) {
+            break;
+        }
+
         constexpr bool train = true;
-        const int64_t idata_in_loop = idata*ubatch_per_ctx;
+        const int64_t idata_in_loop = idata * ubatch_per_ctx;
 
         ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
         opt_epoch_iter(dataset, result_train, tokens, labels_sparse, batch,
             callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start);
+
+        // Check again after iteration in case it was set during processing
+        if (training_should_stop.load(std::memory_order_acquire)) {
+            break;
+        }
     }
 
     t_loop_start = ggml_time_us();
     ndata_in_loop = (ndata - idata_split)*ubatch_per_ctx;
     for (; idata < ndata; ++idata) {
+        // Check for early exit request before processing batch
+        if (training_should_stop.load(std::memory_order_acquire)) {
+            break;
+        }
+
         constexpr bool train = false;
         const int64_t idata_in_loop = (idata - idata_split)*ubatch_per_ctx;
 
         ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
         opt_epoch_iter(dataset, result_eval, tokens, labels_sparse, batch,
             callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start);
+
+        // Check again after iteration in case it was set during processing
+        if (training_should_stop.load(std::memory_order_acquire)) {
+            break;
+        }
     }
 
     llama_batch_free(batch);
+}
+
+int64_t llama_context::opt_get_iter() {
+    if (!opt_ctx) {
+        return 0;  // Return 0 if optimizer not initialized
+    }
+    return ggml_opt_get_iter(opt_ctx);
+}
+
+bool llama_context::opt_save_state(const char* filename) {
+    if (!opt_ctx) {
+        return false;
+    }
+    return ggml_opt_save_state(opt_ctx, filename);
+}
+
+bool llama_context::opt_load_state(const char* filename) {
+    if (!opt_ctx) {
+        return false;
+    }
+    return ggml_opt_load_state(opt_ctx, filename);
+}
+
+void llama_context::opt_cleanup() {
+    if (opt_ctx) {
+        ggml_opt_free(opt_ctx);
+        opt_ctx                       = nullptr;
+        should_load_optimizer_tensors = false;
+        optimizer_tensors_loaded      = false;
+        pending_optimizer_checkpoint_path.clear();
+    }
+}
+
+void llama_context::opt_request_stop() {
+    training_should_stop.store(true, std::memory_order_release);
+}
+
+void llama_context::opt_reset_stop() {
+    training_should_stop.store(false, std::memory_order_release);
 }
 
 //
@@ -4718,7 +4816,51 @@ void llama_opt_epoch(
         result_eval,
         idata_split,
         callback_train,
-        callback_eval);
+        callback_eval,
+        /*resume_from_batch=*/ -1);
+}
+
+void llama_opt_epoch_resume(
+        struct llama_context    * ctx,
+        ggml_opt_dataset_t        dataset,
+        ggml_opt_result_t         result_train,
+        ggml_opt_result_t         result_eval,
+        int64_t                   idata_split,
+        ggml_opt_epoch_callback   callback_train,
+        ggml_opt_epoch_callback   callback_eval,
+        int64_t                   resume_from_batch) {
+    ctx->opt_epoch(
+        dataset,
+        result_train,
+        result_eval,
+        idata_split,
+        callback_train,
+        callback_eval,
+        resume_from_batch);
+}
+
+int64_t llama_opt_get_iter(struct llama_context * ctx) {
+    return ctx->opt_get_iter();
+}
+
+bool llama_opt_save_state(struct llama_context * ctx, const char * filename) {
+    return ctx->opt_save_state(filename);
+}
+
+bool llama_opt_load_state(struct llama_context * ctx, const char * filename) {
+    return ctx->opt_load_state(filename);
+}
+
+void llama_opt_cleanup(struct llama_context * ctx) {
+    ctx->opt_cleanup();
+}
+
+void llama_opt_request_stop(struct llama_context * ctx) {
+    ctx->opt_request_stop();
+}
+
+void llama_opt_reset_stop(struct llama_context * ctx) {
+    ctx->opt_reset_stop();
 }
 
 int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_ext * batch) {

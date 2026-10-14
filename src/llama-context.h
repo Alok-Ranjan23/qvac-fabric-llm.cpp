@@ -13,6 +13,7 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <atomic>
 #include <map>
 #include <vector>
 
@@ -211,7 +212,24 @@ struct llama_context {
             ggml_opt_result_t       result_eval,
             int64_t                 idata_split,
             ggml_opt_epoch_callback callback_train,
-            ggml_opt_epoch_callback callback_eval);
+            ggml_opt_epoch_callback callback_eval,
+            int64_t                 resume_from_batch = -1);
+
+    // Optimizer state access for checkpointing (delegated to ggml_opt API)
+    int64_t opt_get_iter();
+
+    // Optimizer state persistence
+    bool opt_save_state(const char* filename);
+    bool opt_load_state(const char* filename);
+
+    // Clean up optimizer context to free memory and allow reinitialization
+    void opt_cleanup();
+
+    // Request early exit from training epoch (thread-safe)
+    void opt_request_stop();
+
+    // Reset the stop flag to allow training to continue
+    void opt_reset_stop();
 
     void opt_epoch_iter(
             ggml_opt_dataset_t               dataset,
@@ -397,6 +415,14 @@ private:
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;
+
+    // optimizer state loading (deferred until after ggml_opt_build)
+    std::string pending_optimizer_checkpoint_path;
+    bool should_load_optimizer_tensors = false;
+    bool optimizer_tensors_loaded = false;
+
+    // early exit flag for training epochs (thread-safe)
+    std::atomic<bool> training_should_stop{ false };
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
