@@ -14669,10 +14669,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 2, 1, 3}, k, true));
         }
     }
-    for (int k : {1, 10, 40}) {
+    for (int k : {1, 10, 40, 64}) {
         test_cases.emplace_back(new test_top_k_inf({4096, 2, 1, 1}, k));
         test_cases.emplace_back(new test_top_k_inf({248320, 1, 1, 1}, k));
     }
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {1 << 20, 1, 1, 1}, 64));
 
     for (int i = 0; i < 20; ++i) {
         for (int k : {1, 2, 3, 7, 15, 100, 500, 1023, 9999}) {

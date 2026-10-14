@@ -877,6 +877,8 @@ struct ggml_backend_opencl_context {
     // scratch copy of the router weights to avoid dst aliasing
     ggml_cl_buffer prealloc_moe_combine_w;
     ggml_cl_buffer prealloc_splitk_partial;  // [ksplit * M] partials for split-K GEMV
+    ggml_cl_buffer prealloc_top_k_value;     // per-chunk top-k candidates of every row
+    ggml_cl_buffer prealloc_top_k_index;
 
     // pool of persistent image1d_buffer views over kv-cache layers, keyed by
     // (parent buffer, offset within parent)
@@ -1127,6 +1129,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_solve_tri_f32;
     cl_kernel kernel_im2col_f32, kernel_im2col_f16;
     cl_kernel kernel_argsort_f32_i32;
+    cl_kernel kernel_top_k_f32_partial, kernel_top_k_f32_merge;
     cl_kernel kernel_sum_rows_f32, kernel_sum_rows_f32_4;
     cl_kernel kernel_cumsum_blk, kernel_cumsum_add;
     cl_kernel kernel_repeat_f32;
@@ -1929,6 +1932,12 @@ static size_t kquant_mc_subgroups(const ggml_backend_opencl_context * backend_ct
     return kquant_mc_resident_waves(nsg, cap_waves) > kquant_mc_resident_waves(base_nsg, cap_waves) ? nsg : base_nsg;
 }
 #endif
+
+static constexpr int    TOP_K_MAX_K          = 64;
+static constexpr int    TOP_K_CHUNK          = 4096;   // row elements per work-group of the first pass
+static constexpr size_t TOP_K_WG_SIZE        = 128;    // TOP_K_WG_SIZE of top_k.cl, set at build
+static constexpr int    TOP_K_MAX_CANDIDATES = 16384;  // per row, merged by the single work-group of the second pass
+static constexpr int    TOP_K_MASK_WORD_BITS = 32;     // one bit per entry in the kernels' local taken-mask
 
 static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     if (backend_ctx->kernels_loaded) {
@@ -3603,6 +3612,24 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
         CL_CHECK((backend_ctx->kernel_cumsum_blk = clCreateKernel(prog, "kernel_cumsum_blk", &err), err));
         CL_CHECK((backend_ctx->kernel_cumsum_add = clCreateKernel(prog, "kernel_cumsum_add", &err), err));
+        GGML_LOG_CONT(".");
+        CL_CHECK(clReleaseProgram(prog));
+    }
+
+    // top_k: built without the fast-math options, since masked logits are -inf and must compare as such
+    {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "top_k.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("top_k.cl");
+#endif
+        const std::string top_k_opts = std::string("-cl-std=") + opencl_c_std + " -DTOP_K_WG_SIZE=" + std::to_string(TOP_K_WG_SIZE);
+        cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(), top_k_opts);
+
+        CL_CHECK((backend_ctx->kernel_top_k_f32_partial = clCreateKernel(prog, "kernel_top_k_f32_partial", &err), err));
+        CL_CHECK((backend_ctx->kernel_top_k_f32_merge   = clCreateKernel(prog, "kernel_top_k_f32_merge",   &err), err));
         GGML_LOG_CONT(".");
         CL_CHECK(clReleaseProgram(prog));
     }
@@ -9401,6 +9428,16 @@ static bool ggml_cl_q6_K_row_view_supported(const ggml_backend_opencl_context * 
            !use_q6k_tiled(backend_ctx, w) && use_adreno_kernels(backend_ctx, a);
 }
 
+static int ggml_cl_top_k_chunks(int64_t ne00) {
+    return (int) CEIL_DIV(ne00, (int64_t) TOP_K_CHUNK);
+}
+
+static bool ggml_cl_top_k_supported(const ggml_tensor * op) {
+    const int k = (int) op->ne[0];
+    return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) &&
+           k <= TOP_K_MAX_K && (int64_t) ggml_cl_top_k_chunks(op->src[0]->ne[0]) * k <= TOP_K_MAX_CANDIDATES;
+}
+
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
@@ -9781,6 +9818,8 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
 
             return cols <= max_workgroup_size && op->src[0]->type == GGML_TYPE_F32;
         }
+        case GGML_OP_TOP_K:
+            return ggml_cl_top_k_supported(op);
         case GGML_OP_SUM_ROWS:
         case GGML_OP_CUMSUM:
             return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
@@ -29037,6 +29076,67 @@ static void ggml_cl_im2col(ggml_backend_t backend, const ggml_tensor * src0, con
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+// First pass: each work-group keeps the k largest of one TOP_K_CHUNK slice of a row; second pass: one work-group
+// per row keeps the k largest of those candidates.
+static void ggml_cl_top_k(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0 && src0->extra);
+    GGML_ASSERT(dst && dst->extra);
+    GGML_ASSERT(ggml_cl_top_k_supported(dst));
+    GGML_UNUSED(src1);
+
+    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
+
+    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *) src0->extra;
+    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+
+    const cl_ulong offset0 = extra0->offset + src0->view_offs;
+    const cl_ulong offsetd = extrad->offset + dst->view_offs;
+    const cl_ulong nb01    = src0->nb[1];
+    const cl_ulong nb1     = dst->nb[1];
+
+    const int ne00     = (int) src0->ne[0];
+    const int k        = (int) dst->ne[0];
+    const int nrows    = (int) ggml_nrows(src0);
+    const int chunk    = TOP_K_CHUNK;
+    const int n_chunks = ggml_cl_top_k_chunks(ne00);
+    const int n_cand   = n_chunks * k;
+
+    const size_t cand_count = (size_t) nrows * n_cand;
+    backend_ctx->prealloc_top_k_value.allocate(backend_ctx->context, cand_count * sizeof(cl_float));
+    backend_ctx->prealloc_top_k_index.allocate(backend_ctx->context, cand_count * sizeof(cl_int));
+    cl_mem cand_value = backend_ctx->prealloc_top_k_value.buffer;
+    cl_mem cand_index = backend_ctx->prealloc_top_k_index.buffer;
+
+    cl_kernel partial = backend_ctx->kernel_top_k_f32_partial;
+    CL_CHECK(clSetKernelArg(partial, 0, sizeof(cl_mem),   &extra0->data_device));
+    CL_CHECK(clSetKernelArg(partial, 1, sizeof(cl_ulong), &offset0));
+    CL_CHECK(clSetKernelArg(partial, 2, sizeof(cl_ulong), &nb01));
+    CL_CHECK(clSetKernelArg(partial, 3, sizeof(int),      &ne00));
+    CL_CHECK(clSetKernelArg(partial, 4, sizeof(int),      &k));
+    CL_CHECK(clSetKernelArg(partial, 5, sizeof(int),      &chunk));
+    CL_CHECK(clSetKernelArg(partial, 6, sizeof(cl_mem),   &cand_value));
+    CL_CHECK(clSetKernelArg(partial, 7, sizeof(cl_mem),   &cand_index));
+    CL_CHECK(clSetKernelArg(partial, 8, CEIL_DIV(chunk, TOP_K_MASK_WORD_BITS) * sizeof(cl_uint), NULL));
+
+    size_t partial_local[3]  = { TOP_K_WG_SIZE, 1, 1 };
+    size_t partial_global[3] = { (size_t) n_chunks * TOP_K_WG_SIZE, (size_t) nrows, 1 };
+    backend_ctx->enqueue_ndrange_kernel(partial, 3, partial_global, partial_local, dst);
+
+    cl_kernel merge = backend_ctx->kernel_top_k_f32_merge;
+    CL_CHECK(clSetKernelArg(merge, 0, sizeof(cl_mem),   &cand_value));
+    CL_CHECK(clSetKernelArg(merge, 1, sizeof(cl_mem),   &cand_index));
+    CL_CHECK(clSetKernelArg(merge, 2, sizeof(int),      &n_cand));
+    CL_CHECK(clSetKernelArg(merge, 3, sizeof(int),      &k));
+    CL_CHECK(clSetKernelArg(merge, 4, sizeof(cl_mem),   &extrad->data_device));
+    CL_CHECK(clSetKernelArg(merge, 5, sizeof(cl_ulong), &offsetd));
+    CL_CHECK(clSetKernelArg(merge, 6, sizeof(cl_ulong), &nb1));
+    CL_CHECK(clSetKernelArg(merge, 7, CEIL_DIV(n_cand, TOP_K_MASK_WORD_BITS) * sizeof(cl_uint), NULL));
+
+    size_t merge_local[3]  = { TOP_K_WG_SIZE, 1, 1 };
+    size_t merge_global[3] = { TOP_K_WG_SIZE, (size_t) nrows, 1 };
+    backend_ctx->enqueue_ndrange_kernel(merge, 3, merge_global, merge_local, dst);
+}
+
 static void ggml_cl_argsort(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_ASSERT(src0);
     GGML_ASSERT(src0->extra);
@@ -29974,6 +30074,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
                 return false;
             }
             func = ggml_cl_argsort;
+            break;
+        case GGML_OP_TOP_K:
+            if (!any_on_device) {
+                return false;
+            }
+            func = ggml_cl_top_k;
             break;
         case GGML_OP_SUM_ROWS:
             if (!any_on_device) {
