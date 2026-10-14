@@ -1992,6 +1992,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 &&
                    op->type         == GGML_TYPE_F32;
+        case GGML_OP_LSTM_CELL:
+            return ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->type         == GGML_TYPE_F32 &&
+                   (!op->src[2] || (ggml_is_contiguous(op->src[2]) &&
+                                    op->src[2]->type == GGML_TYPE_I32));
         case GGML_OP_PAD:
         case GGML_OP_PAD_REFLECT_1D:
         case GGML_OP_TIMESTEP_EMBEDDING:
