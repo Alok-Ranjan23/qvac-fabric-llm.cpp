@@ -1532,7 +1532,9 @@ static bool ggml_metal_fusion_check_memory_ranges(
         for (int j = 0; j < node_count; ++j) {
             for (int s = 0; s < GGML_MAX_SRC; ++s) {
                 const ggml_tensor * src = nodes[j]->src[s];
-                if (!src || src->op == GGML_OP_NONE || same_memory(src, dst)) {
+                // Scheduler copies are OP_NONE tensors too. Their storage can be
+                // reused after the original operation, but fusion keeps it live.
+                if (!src || same_memory(src, dst)) {
                     continue;
                 }
 
