@@ -286,7 +286,7 @@ struct llama_hparams {
     bool     indexer_kpool_select_tail = true;
     // head-size slots per cached indexer row, the last one holds the pooled key
     uint32_t indexer_kpool_row = 3;
-    // pools are consecutive cells in sequence order, not runs of consecutive positions
+    // pool by cell order: M-RoPE repeats positions and edits leave gaps
     bool     indexer_kpool_by_order = false;
     // MSA
     uint32_t indexer_block_size  = 0;

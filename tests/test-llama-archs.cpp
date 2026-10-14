@@ -1642,61 +1642,222 @@ static int test_hadamard_contracts() {
 }
 
 static int test_glm5_kpool_sequences() {
-    struct selected_cells {
-        std::vector<int32_t> indices;
-    } selected;
+    // last row of the layer 0 selection mask (0 = visible) and indexer score
+    struct observed_rows {
+        std::vector<float> sel;
+        std::vector<float> score;
+    } obs;
 
     auto observe = [](ggml_tensor * tensor, bool ask, void * data) {
-        if (std::strncmp(tensor->name, "indexer_sel_idx-0", 17) != 0) {
+        const bool is_sel   = std::strcmp(tensor->name, "indexer_sel-0") == 0;
+        const bool is_score = std::strcmp(tensor->name, "indexer_score-0") == 0;
+        if (!is_sel && !is_score) {
             return false;
         }
         if (!ask) {
-            auto & indices = static_cast<selected_cells *>(data)->indices;
-            indices.resize(ggml_nelements(tensor));
-            ggml_backend_tensor_get(tensor, indices.data(), 0, ggml_nbytes(tensor));
+            GGML_ASSERT(ggml_is_contiguous(tensor));
+            GGML_ASSERT(tensor->type == GGML_TYPE_F32 || tensor->type == GGML_TYPE_F16);
+            const int64_t n_row = tensor->ne[0];
+            const size_t  esize = ggml_type_size(tensor->type);
+            std::vector<uint8_t> raw(n_row*esize);
+            ggml_backend_tensor_get(tensor, raw.data(), ggml_nbytes(tensor) - raw.size(), raw.size());
+            auto & row = is_sel ? static_cast<observed_rows *>(data)->sel : static_cast<observed_rows *>(data)->score;
+            row.resize(n_row);
+            for (int64_t i = 0; i < n_row; ++i) {
+                row[i] = tensor->type == GGML_TYPE_F16 ?
+                    ggml_fp16_to_fp32(((const ggml_fp16_t *) raw.data())[i]) : ((const float *) raw.data())[i];
+            }
         }
         return true;
     };
     auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
     gguf_set_val_u32(metadata.get(), "glm5-next.attention.indexer.top_k", 12);
     auto loaded = get_model_and_ctx(metadata.get(), nullptr, 1234, 0.1f, {}, LLAMA_SPLIT_MODE_LAYER,
-            false, 2, true, observe, &selected);
-    auto * ctx = loaded.second.get();
+            false, 2, true, observe, &obs);
+    llama_model * model = loaded.first.get();
+    const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
+    // same context setup as get_model_and_ctx
+    auto new_ctx = [&](uint32_t n_seq_max = 2) {
+        llama_context_params cp = llama_context_default_params();
+        cp.n_ctx = 0;
+        cp.n_threads = cp.n_threads_batch = 4;
+        cp.n_seq_max = n_seq_max;
+        cp.kv_unified = true;
+        cp.n_ubatch = 64;
+        cp.cb_eval = observe;
+        cp.cb_eval_user_data = &obs;
+        llama_context_ptr ctx(llama_init_from_model(model, cp));
+        GGML_ASSERT(ctx);
+        return ctx;
+    };
 
     struct test_token {
         llama_token token;
         llama_pos pos;
         std::vector<llama_seq_id> seq_ids;
     };
-    auto decode = [ctx](const std::vector<test_token> & entries) {
-        llama_batch batch = llama_batch_init(entries.size(), 0, 2);
+    // last-token logits, or empty if decode returns rc_expected
+    auto decode = [n_vocab](llama_context * ctx, const std::vector<test_token> & entries, int rc_expected = 0) {
+        llama_batch batch = llama_batch_init(entries.size(), 0, 8);
         for (size_t i = 0; i < entries.size(); ++i) {
             common_batch_add(batch, entries[i].token, entries[i].pos, entries[i].seq_ids, i + 1 == entries.size());
         }
         const int rc = llama_decode(ctx, batch);
         llama_batch_free(batch);
-        GGML_ASSERT(rc == 0);
+        GGML_ASSERT(rc == rc_expected);
+        if (rc != 0) {
+            return std::vector<float>();
+        }
+        const float * logits = llama_get_logits_ith(ctx, -1);
+        return std::vector<float>(logits, logits + n_vocab);
     };
-    auto unique_count = [&]() {
-        GGML_ASSERT(!selected.indices.empty());
-        return std::set<int32_t>(selected.indices.begin(), selected.indices.end()).size();
+    auto run = [&](llama_context * ctx, llama_pos p0, llama_pos p1, const std::vector<llama_seq_id> & seq_ids, llama_token tok0,
+            int rc_expected = 0) {
+        std::vector<test_token> entries;
+        for (llama_pos p = p0; p < p1; ++p) {
+            entries.push_back({ tok0 + (llama_token) (p - p0), p, seq_ids });
+        }
+        return decode(ctx, entries, rc_expected);
     };
+    auto n_visible = [&]() {
+        GGML_ASSERT(!obs.sel.empty());
+        return std::count(obs.sel.begin(), obs.sel.end(), 0.0f);
+    };
+    // scores of the visible pools, in pool order
+    auto visible_scores = [&]() {
+        std::vector<float> res;
+        for (float v : obs.score) {
+            if (std::isfinite(v)) {
+                res.push_back(v);
+            }
+        }
+        GGML_ASSERT(!res.empty());
+        return res;
+    };
+    auto check = [](bool ok, const char * what) {
+        if (!ok) {
+            printf("FAIL: GLM5 k-pool %s\n", what);
+        }
+        return ok;
+    };
+    bool ok = true;
 
-    decode({{2, 0, {0}}, {3, 1, {0}}, {4, 2, {0}}, {5, 3, {0}}});
-    llama_memory_seq_add(llama_get_memory(ctx), 0, 2, 4, 1); // live positions 0, 1, 3, 4
-    selected.indices.clear();
-    decode({{6, 5, {0}}});
-    GGML_ASSERT(llama_memory_seq_token_count(llama_get_memory(ctx), 0) == 5);
-    GGML_ASSERT(unique_count() >= 5); // positions 0, 1, 3, 4, 5 must all be selected
+    // edit: live positions 0, 1, 3, 4, then decode position 5
+    {
+        llama_context * ctx = loaded.second.get();
+        run(ctx, 0, 4, {0}, 2);
+        llama_memory_seq_add(llama_get_memory(ctx), 0, 2, 4, 1);
+        obs.sel.clear();
+        run(ctx, 5, 6, {0}, 6);
+        GGML_ASSERT(llama_memory_seq_token_count(llama_get_memory(ctx), 0) == 5);
+        ok &= check(n_visible() == 5, "edit: positions 0, 1, 3, 4, 5 must all be visible");
+    }
 
-    llama_memory_clear(llama_get_memory(ctx), true);
-    decode({{10, 0, {0, 1}}, {11, 1, {0, 1}}, {12, 2, {0, 1}}, {13, 3, {0, 1}}});
-    decode({{20, 4, {0}}, {21, 5, {0}}, {22, 6, {0}}, {23, 7, {0}}});
-    decode({{30, 4, {1}}, {31, 5, {1}}, {32, 6, {1}}, {33, 7, {1}}});
-    selected.indices.clear();
-    decode({{40, 8, {0, 1}}});
-    GGML_ASSERT(unique_count() >= 13); // shared prefix once, both unique branches, current token
+    // shared token: follows seq_id[0] like the dense KQ mask, so it should decode like seq 0 alone
+    {
+        llama_context * ctx = loaded.second.get();
+        llama_memory_clear(llama_get_memory(ctx), true);
+        run(ctx, 0, 4, {0, 1}, 10);
+        run(ctx, 4, 8, {0},    20);
+        run(ctx, 4, 8, {1},    30);
+        obs.sel.clear();
+        const auto shared = run(ctx, 8, 9, {0, 1}, 40);
+        ok &= check(n_visible() == 9, "shared: shared prefix, one branch and current token must be visible");
 
+        // seq 0 branch is cells 4-7, seq 1 is 8-11
+        const llama_seq_id owner = obs.sel.size() > 4 && obs.sel[4] == 0.0f ? 0 : 1;
+        const auto branch = obs.sel.begin() + 4 + 4*owner;
+        const auto other  = obs.sel.begin() + 8 - 4*owner;
+        ok &= check(obs.sel.size() > 12 && std::all_of(branch, branch + 4, [](float v) { return v == 0.0f; }) &&
+                std::none_of(other, other + 4, [](float v) { return v == 0.0f; }), "shared: the other branch must not be visible");
+        const auto next = run(ctx, 9, 10, {owner}, 41);
+
+        auto ref = new_ctx();
+        run(ref.get(), 0, 4, {0}, 10);
+        run(ref.get(), 4, 8, {0}, owner == 0 ? 20 : 30);
+        ok &= check(nmse(run(ref.get(), 8, 9, {0}, 40), shared) < 1e-6, "shared: logits differ from its sequence alone");
+        ok &= check(nmse(run(ref.get(), 9, 10, {0}, 41), next) < 1e-6, "shared: next logits differ from its sequence alone");
+    }
+
+    // rep clash: seq 0's first pool (cells 3, 5, 6, 7) ends on seq 1's rep; both keep their own scores
+    {
+        const llama_pos n_prefix = 24;
+        auto edit = [](llama_context * ctx) {
+            llama_memory_seq_rm(llama_get_memory(ctx), 0, 0, 3);
+            llama_memory_seq_rm(llama_get_memory(ctx), 0, 4, 5);
+        };
+
+        llama_context * ctx = loaded.second.get();
+        llama_memory_clear(llama_get_memory(ctx), true);
+        run(ctx, 0, n_prefix, {0, 1}, 10);
+        edit(ctx);
+        const auto logits0 = run(ctx, n_prefix, n_prefix + 1, {0}, 60);
+        const auto scores0 = visible_scores();
+        const auto logits1 = run(ctx, n_prefix, n_prefix + 1, {1}, 70);
+        const auto scores1 = visible_scores();
+
+        auto ref0 = new_ctx();
+        run(ref0.get(), 0, n_prefix, {0}, 10);
+        edit(ref0.get());
+        ok &= check(nmse(run(ref0.get(), n_prefix, n_prefix + 1, {0}, 60), logits0) < 1e-6, "rep clash: seq 0 logits");
+        ok &= check(visible_scores().size() == scores0.size() && nmse(visible_scores(), scores0) < 1e-6, "rep clash: seq 0 scores");
+
+        auto ref1 = new_ctx();
+        run(ref1.get(), 0, n_prefix, {0}, 10);
+        ok &= check(nmse(run(ref1.get(), n_prefix, n_prefix + 1, {0}, 70), logits1) < 1e-6, "rep clash: seq 1 logits");
+        ok &= check(visible_scores().size() == scores1.size() && nmse(visible_scores(), scores1) < 1e-6, "rep clash: seq 1 scores");
+    }
+
+    // aborted rebuild: removing seq 0 moves seq 1's pool back to cell 7, which still holds
+    // seq 0's pooled key. An aborted decode must not mark that row as rebuilt.
+    {
+        const llama_pos n_prefix = 24;
+        auto setup = [&](llama_context * ctx) {
+            llama_memory_clear(llama_get_memory(ctx), true);
+            run(ctx, 0, n_prefix, {0, 1}, 10);
+            llama_memory_seq_rm(llama_get_memory(ctx), 0, 1, 2);
+            llama_memory_seq_rm(llama_get_memory(ctx), 0, 4, 7);
+            run(ctx, n_prefix, n_prefix + 1, {0}, 60);
+            llama_memory_seq_rm(llama_get_memory(ctx), 0, -1, -1);
+        };
+
+        bool abort = false;
+        auto ctx = new_ctx();
+        llama_set_abort_callback(ctx.get(), [](void * data) { return *static_cast<bool *>(data); }, &abort);
+        setup(ctx.get());
+        abort = true;
+        run(ctx.get(), 0, 1, {0}, 80, 2);
+        abort = false;
+        const auto logits = run(ctx.get(), n_prefix, n_prefix + 1, {1}, 70);
+        const auto scores = visible_scores();
+
+        auto ref = new_ctx();
+        setup(ref.get());
+        ok &= check(nmse(run(ref.get(), n_prefix, n_prefix + 1, {1}, 70), logits) < 1e-6, "aborted rebuild: seq 1 logits");
+        ok &= check(visible_scores().size() == scores.size() && nmse(visible_scores(), scores) < 1e-6, "aborted rebuild: seq 1 scores");
+    }
+
+    // padding: five shared sequences make nearly every cell a rep, the pads still need free rows
+    {
+        const std::vector<llama_seq_id> all = { 0, 1, 2, 3, 4 };
+        auto ctx = new_ctx(5);
+        run(ctx.get(), 0, 64, all, 10);
+        for (llama_seq_id s = 1; s < 5; ++s) {
+            llama_memory_seq_rm(llama_get_memory(ctx.get()), s, 0, s);
+        }
+        for (llama_pos p = 64; p < 248; p += 64) {
+            run(ctx.get(), p, std::min<llama_pos>(p + 64, 248), all, 10);
+        }
+        for (llama_pos p = 248; p < 256; ++p) {
+            const auto logits = run(ctx.get(), p, p + 1, all, 10);
+            ok &= check(std::all_of(logits.begin(), logits.end(), [](float v) { return std::isfinite(v); }), "padding: logits");
+        }
+    }
+
+    if (!ok) {
+        return 1;
+    }
     printf("GLM5 k-pool sequence edit and shared-token tests passed\n");
     return 0;
 }
