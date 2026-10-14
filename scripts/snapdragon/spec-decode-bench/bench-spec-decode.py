@@ -72,7 +72,7 @@ def sh(args, timeout=None, check=True):
 def read_thermal(dev):
     raw = dev.shell(f"cat {KGSL}/thermal_pwrlevel {KGSL}/max_gpuclk {KGSL}/temp; "
                     "dumpsys thermalservice | grep -m1 'Thermal Status' | tr -dc '0-9'; echo; "
-                    "dumpsys thermalservice | grep -m1 'mName=SKIN' | sed 's/.*mValue=\\([0-9.]*\\).*/\\1/'")
+                    "dumpsys thermalservice | sed -n '/Current temperatures from HAL/,/Current cooling/p' | grep -m1 'mName=SKIN' | sed 's/.*mValue=\\([0-9.]*\\).*/\\1/'")
     parts = raw.split()
     return {
         "gpu_pwrlevel": int(parts[0]),
