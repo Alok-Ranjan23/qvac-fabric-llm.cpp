@@ -43,6 +43,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_TOPK_MOE,     // SOFT_MAX + ARGSORT + GET_ROWS + norm/scale (MoE routing)
     GGML_METAL_FUSION_MOE_REDUCE,   // MUL + expert VIEWs + ADD chain (MoE output reduction)
     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
+    GGML_METAL_FUSION_DW_NORM_CHANNEL, // CONV_1D_DW_DIRECT + NORM_CHANNEL
     GGML_METAL_FUSION_MUL_MV_GLU,   // MUL_MAT(_ID) up + gate + GLU (swiglu), single-token decode
     GGML_METAL_FUSION_MUL_MV_ID_MUL, // MUL_MAT_ID + MUL (routing weights), mat-vec path; yields to MOE_REDUCE
     GGML_METAL_FUSION_UNARY_MUL,    // UNARY (silu/sigmoid/softplus) + MUL
