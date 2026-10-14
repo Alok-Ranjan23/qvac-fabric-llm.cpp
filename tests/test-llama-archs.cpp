@@ -110,7 +110,6 @@ static void usage(char ** argv) {
     LOG("  --mtp-shared[-cpu]       Run only the shared native-MTP buffer test (must be the sole argument)\n");
     LOG("  --hadamard-contracts     Run only the Hadamard GGUF contract test (must be the sole argument)\n");
     LOG("  --glm5-kpool-sequences   Run only the GLM5 k-pool sequence edit and shared-token test\n");
-    LOG("  --glm5-invalid-metadata  Run only the GLM5 invalid-metadata rejection test\n");
     LOG("  --qsa-unified-multiseq   Run only the QSA unified multi-sequence fallback test\n");
     LOG("  --layer-inp-pos-min      Run only the layer-input pos_min copy test\n\n");
     LOG("Examples:\n");
@@ -163,10 +162,6 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_embd = 160; // exercise per-head tensor split granularity with head size 80
     } else if (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE) {
         n_head = 4;
-    } else if (arch == LLM_ARCH_GLM5_NEXT) {
-        n_embd = 128;
-        n_head = 8;
-        n_ff   = 192;
     } else if (arch == LLM_ARCH_DEEPSEEK2
             || arch == LLM_ARCH_DEEPSEEK32
             || arch == LLM_ARCH_GLM_DSA
@@ -225,21 +220,14 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 
     if (arch == LLM_ARCH_PLAMO2 || arch == LLM_ARCH_JAMBA || arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE ||
             arch == LLM_ARCH_GRANITE_HYBRID || arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE || arch == LLM_ARCH_KIMI_LINEAR ||
-            arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_KIMI_K3 || arch == LLM_ARCH_GLM5_NEXT) {
+            arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_KIMI_K3) {
         GGML_ASSERT(n_layer >= 2);
         std::vector<uint32_t> n_head_per_layer;
         n_head_per_layer.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
-            // GLM5 stores one compressed MLA latent on DSA layers; its query
-            // heads are still described by the uniform attention head count.
-            n_head_per_layer.push_back(il == 1 ? 0 : (arch == LLM_ARCH_GLM5_NEXT ? 1 : n_head));
+            n_head_per_layer.push_back(il == 1 ? 0 : n_head);
         }
-        // GLM5 next KDA heads come from the uniform head count, only head_count_kv is per layer.
-        if (arch == LLM_ARCH_GLM5_NEXT) {
-            ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
-        } else {
-            ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
-        }
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
@@ -258,13 +246,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_KIMI_LINEAR
             || arch == LLM_ARCH_BAILINGMOE3
             || arch == LLM_ARCH_KIMI_K3
-            || arch == LLM_ARCH_GLM5_NEXT
             || arch == LLM_ARCH_MISTRAL4
             || arch == LLM_ARCH_HY_V4) {
-        // GLM5 next MLA is nope only, the cache row is the compressed latent alone.
-        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       arch == LLM_ARCH_GLM5_NEXT ? uint32_t(512) : uint32_t(576));
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(576));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
-        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       arch == LLM_ARCH_GLM5_NEXT ? uint32_t(0) : uint32_t(64));
+        ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(192));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
         if (arch == LLM_ARCH_DOTS3NOTE) {
@@ -320,10 +306,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
 
     // MSA requires one indexer head per GQA (KV) head, unlike the DSA archs where the
     // indexer head count is independent of the main attention head count.
-    if (arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5_NEXT) {
+    if (arch == LLM_ARCH_QWEN4EXP) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,    uint32_t(4));
-        ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
-        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,  1.0e-6f);
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
         // without this the QSA layers fall back to dense and go uncovered
         ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
@@ -366,8 +350,6 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(131072));
 
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL,        uint32_t(4));
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL, true);
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
     // mrope sections count rope pairs; Ling 3.0 VL files carry [t, h, w] sections
     // summing to n_rot / 2 (n_rot is 64 in this fixture)
@@ -615,7 +597,6 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_KIMI_K3:
-        case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_MELLUM:
@@ -968,10 +949,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 std::string status_roundtrip = "\033[1;33mSKIP\033[0m";
                 char nmse_str[12] = {0};
 
-                // GLM5 query and indexer head counts are not divisible by three.
-                const bool unsupported_glm5_split =
-                    arch == LLM_ARCH_GLM5_NEXT && dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.size() == 3;
-                bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty()) || unsupported_glm5_split;
+                bool skip = !arch_supported(arch) || (dc.split_mode == LLAMA_SPLIT_MODE_TENSOR && dc.devs.empty());
                 bool test_executed = false;
                 bool test_ok = true;
                 if (!skip) {
@@ -1710,35 +1688,6 @@ static int test_glm5_kpool_sequences() {
     return 0;
 }
 
-static int test_glm5_invalid_metadata() {
-    struct invalid_case {
-        const char * key;
-        uint32_t value;
-    };
-    const invalid_case cases[] = {
-        {"glm5-next.nextn_predict_layers", 2},
-        {"glm5-next.attention.indexer.kpool", 0},
-        {"glm5-next.attention.indexer.top_k", 0},
-        {"glm5-next.attention.indexer.top_k", 5},
-        {"glm5-next.hyper_connection.count", 3},
-    };
-
-    for (const auto & test : cases) {
-        auto metadata = get_gguf_ctx(LLM_ARCH_GLM5_NEXT, true);
-        gguf_set_val_u32(metadata.get(), test.key, test.value);
-        auto params = llama_model_default_params();
-        tensor_data_params tensor_params = { 1234, 0.1f };
-        llama_model_ptr model(llama_model_init_from_user(metadata.get(), set_tensor_data, &tensor_params, params));
-        if (model) {
-            printf("FAIL: GLM5 accepted %s=%u\n", test.key, test.value);
-            return 1;
-        }
-    }
-
-    printf("GLM5 invalid metadata rejected without aborting\n");
-    return 0;
-}
-
 static constexpr uint32_t  LAYER_INP_LID       = 1;
 static constexpr uint32_t  LAYER_INP_N_TOKENS  = 128; // two ubatches of 64
 static constexpr llama_pos LAYER_INP_POS_MIN   = 80;  // skips the first ubatch and part of the second
@@ -1824,9 +1773,6 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && strcmp(argv[1], "--glm5-kpool-sequences") == 0) {
         return test_glm5_kpool_sequences();
-    }
-    if (argc == 2 && strcmp(argv[1], "--glm5-invalid-metadata") == 0) {
-        return test_glm5_invalid_metadata();
     }
     if (argc == 2 && strcmp(argv[1], "--layer-inp-pos-min") == 0) {
         return test_layer_inp_pos_min();
