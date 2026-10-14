@@ -236,6 +236,7 @@ struct llama_context {
             ggml_opt_result_t                result,
             const std::vector<llama_token> & tokens,
             const std::vector<llama_token> & labels_sparse,
+            const std::vector<int32_t>     & masks_sparse,
             llama_batch                    & batch,
             ggml_opt_epoch_callback          callback,
             bool                             train,
@@ -420,6 +421,7 @@ private:
     std::string pending_optimizer_checkpoint_path;
     bool should_load_optimizer_tensors = false;
     bool optimizer_tensors_loaded = false;
+    ggml_opt_loss_type opt_loss_type = GGML_OPT_LOSS_TYPE_CROSS_ENTROPY;
 
     // early exit flag for training epochs (thread-safe)
     std::atomic<bool> training_should_stop{ false };
