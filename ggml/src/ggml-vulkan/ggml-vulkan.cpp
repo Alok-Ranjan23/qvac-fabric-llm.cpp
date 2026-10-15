@@ -1074,6 +1074,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_add_id_f32;
 
     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
+    vk_pipeline pipeline_concat_transpose_i32;
     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
     vk_pipeline pipeline_scale_f32;
     vk_pipeline pipeline_log[2];
@@ -2999,6 +3000,31 @@ static bool ggml_vk_concat_supported(const ggml_tensor * src0, const ggml_tensor
 
     // Quantized tensor rows are block-aligned when created.
     return ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(src1) && ggml_is_contiguous_rows(dst);
+}
+
+// The delta-net conv-state path does ggml_transpose() straight into a dim-0 ggml_concat(), so the generic concat
+// kernel walks src1 with a conv_channels * 4 byte stride. On qwen35 that is 40960 B = 160 * 256 B, so every read
+// lands on the same memory channel: 13.7 GB/s against 138.9 GB/s for a tiled transpose (gfx1151). Route that
+// exact shape to the tiled kernel; GGML_VK_CONCAT_TRANSPOSE=0 opts out.
+static bool ggml_vk_concat_is_transposed(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    static const char * env = getenv("GGML_VK_CONCAT_TRANSPOSE");
+    if (env && env[0] == '0') {
+        return false;
+    }
+    if (ggml_get_op_params_i32(dst, 0) != 0) {           // dim 0 only
+        return false;
+    }
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    const size_t ts = ggml_type_size(src0->type);
+    if (src0->nb[0] != ts || dst->nb[0] != ts) {          // src0 and dst rows must be contiguous
+        return false;
+    }
+    if (src1->nb[0] <= src1->nb[1]) {                     // src1 must actually be transposed
+        return false;
+    }
+    return src0->ne[1] == src1->ne[1] && dst->ne[1] == src1->ne[1];
 }
 
 template <typename T> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, T &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
@@ -6828,6 +6854,8 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_concat_i8, "concat_i8", concat_i8_len, concat_i8_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i16, "concat_i16", concat_i16_len, concat_i16_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i32, "concat_i32", concat_i32_len, concat_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
+    // one workgroup per 32x32 tile: elements are passed as (rows, cols, 1)
+    ggml_vk_create_pipeline(device, device->pipeline_concat_transpose_i32, "concat_transpose_i32", concat_transpose_i32_len, concat_transpose_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {32, 32, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_concat_i64, "concat_i64", concat_i64_len, concat_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_upscale_nearest_f32, "upscale_f32", upscale_f32_len, upscale_f32_data, "main", 2, sizeof(vk_op_upscale_push_constants), {512, 1, 1}, {GGML_SCALE_MODE_NEAREST}, 1);
@@ -13542,6 +13570,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         if (!ggml_vk_concat_supported(src0, src1, dst)) {
             return nullptr;
         }
+        // the tiled-transpose path handles unquantized 4-byte elements only
+        if (!ggml_is_quantized(src0->type) && ggml_vk_concat_unit_size(src0->type) == 4 &&
+            ggml_vk_concat_is_transposed(src0, src1, dst)) {
+            return ctx->device->pipeline_concat_transpose_i32;
+        }
         switch (ggml_vk_concat_unit_size(src0->type)) {
         case 1:
             return ctx->device->pipeline_concat_i8;
@@ -14695,6 +14728,11 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_GLU:
     case GGML_OP_CONV_2D_DW:
         {
+            // the tiled concat kernel is dispatched per 32x32 tile, not per element
+            if (op == GGML_OP_CONCAT && pipeline == ctx->device->pipeline_concat_transpose_i32) {
+                elements = { (uint32_t)src1->ne[1], (uint32_t)src1->ne[0], 1 };
+                break;
+            }
             uint32_t ne = ggml_nelements(dst);
             if (op == GGML_OP_CPY && ggml_is_quantized(src0->type) && ggml_is_quantized(dst->type)) {
                 // Convert from number of logical elements to 2- or 4-byte units.
