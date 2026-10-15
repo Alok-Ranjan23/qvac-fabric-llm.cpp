@@ -382,6 +382,17 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
                 return true;
             }
 
+            // RDNA3.5 (gfx1151): above 512 rows dequantization + hipBLAS outpaces Q8_0 MMQ. Qwen3.8-27B Q8_0
+            //     prefill: pp1024 291 -> 320 t/s, pp2048 310 -> 354 t/s; at pp512 MMQ is still as fast or faster.
+            //     GGML_CUDA_RDNA3_5_Q8_0_MMQ_MAX overrides the row limit.
+            if (GGML_CUDA_CC_IS_RDNA3_5(cc) && type == GGML_TYPE_Q8_0 && n_experts == 0) {
+                static const int64_t q8_0_mmq_max = [] {
+                    const char * env = getenv("GGML_CUDA_RDNA3_5_Q8_0_MMQ_MAX");
+                    return env ? (int64_t) atoll(env) : 512;
+                }();
+                return ne11 <= q8_0_mmq_max;
+            }
+
             // For some quantization types MMQ can have lower peak TOPS than hipBLAS
             //     so it's only faster for sufficiently small batch sizes:
             switch (type) {
