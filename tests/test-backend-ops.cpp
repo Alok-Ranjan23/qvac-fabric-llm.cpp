@@ -3920,6 +3920,12 @@ struct test_rms_norm : public test_case {
             bool inplace = false)
         : type(type), ne(ne), v(v), eps(eps), inplace(inplace) {}
 
+    // WebGPU dispatches one workgroup per row in X and caps a dispatch dimension at 65535 workgroups
+    bool skip_backend(ggml_backend_t backend) override {
+        const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
+        return strcmp(name, "WebGPU") == 0 && ne[1] * ne[2] * ne[3] > 65535;
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
         ggml_set_param(a);
