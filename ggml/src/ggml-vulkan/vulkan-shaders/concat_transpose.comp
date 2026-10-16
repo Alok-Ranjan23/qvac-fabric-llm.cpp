@@ -17,27 +17,40 @@ void main() {
 
     const uint row = gl_WorkGroupID.x * 32 + tx;
 
+    const uint d_offset = get_doffset();
+    const uint a_offset = get_aoffset();
+    const uint b_offset = get_boffset();
+
     // src0 is already contiguous, copy it straight through.
     if (gl_WorkGroupID.y == 0 && row < p.ne01) {
+        const uint d_row = d_offset + row*p.nb21;
+        const uint a_row = a_offset + row*p.nb01;
         for (uint i0 = ty; i0 < p.ne00; i0 += 8) {
-            data_d[get_doffset() + row*p.nb21 + i0*p.nb20] = D_TYPE(data_a[get_aoffset() + row*p.nb01 + i0*p.nb00]);
+            data_d[d_row + i0*p.nb20] = D_TYPE(data_a[a_row + i0*p.nb00]);
         }
     }
 
-    [[unroll]] for (uint j = 0; j < 32; j += 8) {
-        const uint c = gl_WorkGroupID.y * 32 + ty + j;
-        if (c < p.ne10 && row < p.ne11) {
-            tmp[ty + j][tx] = A_TYPE(data_b[get_boffset() + c*p.nb10 + row*p.nb11]);
+    if (row < p.ne11) {
+        const uint b_row = b_offset + row*p.nb11;
+        [[unroll]] for (uint j = 0; j < 32; j += 8) {
+            const uint c = gl_WorkGroupID.y * 32 + ty + j;
+            if (c < p.ne10) {
+                tmp[ty + j][tx] = A_TYPE(data_b[b_row + c*p.nb10]);
+            }
         }
     }
 
+    // every invocation reaches the barrier, also in a partial tile
     barrier();
 
     const uint col = gl_WorkGroupID.y * 32 + tx;
-    [[unroll]] for (uint j = 0; j < 32; j += 8) {
-        const uint r = gl_WorkGroupID.x * 32 + ty + j;
-        if (col < p.ne10 && r < p.ne11) {
-            data_d[get_doffset() + r*p.nb21 + (p.ne00 + col)*p.nb20] = D_TYPE(tmp[tx][ty + j]);
+    if (col < p.ne10) {
+        const uint d_col = d_offset + (p.ne00 + col)*p.nb20;
+        [[unroll]] for (uint j = 0; j < 32; j += 8) {
+            const uint r = gl_WorkGroupID.x * 32 + ty + j;
+            if (r < p.ne11) {
+                data_d[d_col + r*p.nb21] = D_TYPE(tmp[tx][ty + j]);
+            }
         }
     }
 }
