@@ -21132,7 +21132,10 @@ static bool ggml_vk_ssm_conv_direct_check(const ggml_backend_vk_context * ctx, c
         tr->nb[0] != (size_t) C * sizeof(float) || tr->nb[1] != sizeof(float) || tr->nb[2] != (size_t) C * T * sizeof(float)) {
         return ggml_vk_ssm_conv_direct_reject("x layout", i);
     }
-    if (T < ssm_conv_direct_min_tokens) {
+    // Short ubatches keep the plain concat + conv, but only the runtime match skips them: graph_optimize
+    // registers the allocation dependencies for every token count, so the graph (node count included) and the
+    // allocation the scheduler reserved for the largest ubatch do not change with the ubatch size.
+    if (runtime && T < ssm_conv_direct_min_tokens) {
         return false;
     }
     if (st->ne[0] != 3 || st->ne[1] != C || st->ne[2] != S || st->ne[3] != 1 || !ggml_is_contiguous(st)) {
