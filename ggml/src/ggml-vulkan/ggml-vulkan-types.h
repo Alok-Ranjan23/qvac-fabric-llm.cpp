@@ -674,6 +674,8 @@ enum rms_norm_mode {
     RMS_NORM_MUL_ROPE,
     RMS_NORM_MUL_ROPE_VIEW_SET_ROWS,
     RMS_NORM_VIEW_SET_ROWS,
+    RMS_NORM_MUL_MUL,   // short rows only: normalised * gamma * gate
+    RMS_NORM_SCALE,     // short rows only: scale(rms_norm(x))
     RMS_NORM_COUNT,
 };
 
@@ -911,6 +913,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_add_id_f32;
 
     vk_pipeline pipeline_concat_i8, pipeline_concat_i16, pipeline_concat_i32, pipeline_concat_i64;
+    vk_pipeline pipeline_concat_transpose_i32;
     vk_pipeline pipeline_upscale_nearest_f32, pipeline_upscale_bilinear_f32, pipeline_upscale_bicubic_f32, pipeline_upscale_bilinear_antialias_f32;
     vk_pipeline pipeline_scale_f32;
     vk_pipeline pipeline_log[2];
@@ -946,6 +949,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_rms_norm_mul_add_mul_partials_f32;
     vk_pipeline pipeline_rms_norm_set_rows_f32_f32;
     vk_pipeline pipeline_rms_norm_set_rows_f32_f16;
+    vk_pipeline pipeline_rms_norm_small_f32;          // one subgroup per row, ne00 <= 256
+    vk_pipeline pipeline_rms_norm_mul_small_f32;
+    vk_pipeline pipeline_rms_norm_mul_mul_small_f32;  // + second multiplier (gated norm)
+    vk_pipeline pipeline_rms_norm_scale_small_f32;    // + SCALE (the GDN q/k l2 norm)
     vk_pipeline pipeline_rms_norm_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_partials_f32;
     vk_pipeline pipeline_rms_norm_mul_rope_f32_f32;
@@ -1086,6 +1093,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_conv_f32;
     vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_ssm_conv_bias_silu_f32;
+    // CONCAT(state, x^T) + SSM_CONV + SILU without the transposed concat: the conv reads x and the state
+    // directly, and the concat node only writes the tail columns its other readers (state copies) use
+    vk_pipeline pipeline_ssm_conv_direct_silu_f32;
+    vk_pipeline pipeline_ssm_conv_tail_f32;
     vk_pipeline pipeline_ssm_conv_back_sx_f32;
     vk_pipeline pipeline_ssm_conv_back_c_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
@@ -1604,6 +1615,21 @@ struct ggml_backend_vk_context {
     bool fused_topk_qsa {};
     bool fused_hc_post_gate {};
     rms_norm_mode fused_rms_norm_mode {RMS_NORM_COUNT};
+    // direct GDN conv: concats matched in this graph (decided at the concat, consumed at its SSM_CONV)
+    struct ssm_conv_direct_match {
+        const ggml_tensor * concat;
+        const ggml_tensor * state;   // [ncs, C, S], contiguous
+        const ggml_tensor * x;       // x^T's storage: [C, T, S], contiguous
+        const ggml_tensor * kern;    // [ncs + 1, C]
+        ggml_tensor * out;           // the SILU node
+        int conv_idx;
+        int64_t tail_from;           // first concat column read by anything but the conv
+    };
+    std::vector<ssm_conv_direct_match> ssm_conv_direct_matches;
+    int fused_concat_tail {-1};      // current CONCAT writes only its tail (index into ssm_conv_direct_matches)
+    int fused_ssm_conv_direct {-1};  // current SSM_CONV (+SILU) runs direct (index into ssm_conv_direct_matches)
+    // set while the current node is a direct conv: srcs read outside node->src (x, state) for the sync tracking
+    const ggml_tensor * fused_extra_srcs[2] {};
     bool fused_fwht_signed {};
     std::atomic<uint64_t> fwht_fusion_count {};
 
