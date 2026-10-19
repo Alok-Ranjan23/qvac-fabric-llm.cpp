@@ -259,6 +259,15 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
+        // spin until the GPU is done instead of sleeping in waitUntilCompleted: waking the sleeping thread
+        // costs ~100+ us after the GPU finishes, which sits on the critical path of token generation
+        for (MTLCommandBufferStatus status = [ctx->cmd_buf_last status];
+             status >= MTLCommandBufferStatusCommitted && status < MTLCommandBufferStatusCompleted;
+             status = [ctx->cmd_buf_last status]) {
+#if defined(__aarch64__)
+            __asm__ __volatile__("isb sy");
+#endif
+        }
         [ctx->cmd_buf_last waitUntilCompleted];
         ctx->cmd_buf_last = nil;
     }
