@@ -45,6 +45,7 @@ typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_CONT_FWHT,     // CONT + MUL + MUL_MAT(hadamard) (the signed FWHT gathers the CONT source)
     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA or one-row PQ2_0 mat-vec store)
     GGML_METAL_FUSION_CPY_BATCH,    // CPY x N (N in [2, GGML_METAL_CPY_BATCH_MAX]), one dispatch
+    GGML_METAL_FUSION_RMS_NORM_MUL_MV, // RMS_NORM + MUL + MUL_MAT x N (norm folded into each single-row mat-vec)
 } ggml_metal_fusion_id;
 
 struct ggml_metal_fusion {
@@ -64,6 +65,12 @@ struct ggml_metal_fusion {
                   const struct ggml_tensor * const    * nodes,
                   const struct ggml_metal_device_props * props,
                         ggml_metal_fusion_mode          mode);
+
+    // optional graph constraints, checked in both modes after check: e.g. that the elided nodes have no consumers
+    // outside the group. idxs[j] is the graph index of the j-th node of the pattern
+    bool (*check_graph)(const struct ggml_metal_fusion * fusion,
+                        const struct ggml_cgraph       * gf,
+                        const int                      * idxs);
 };
 
 typedef struct ggml_metal_fusion ggml_metal_fusion;

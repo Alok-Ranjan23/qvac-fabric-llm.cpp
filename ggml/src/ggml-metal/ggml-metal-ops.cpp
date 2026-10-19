@@ -3669,10 +3669,16 @@ static int ggml_metal_op_mul_mat_mma(ggml_metal_op_t ctx, int idx) {
     return n_fuse;
 }
 
-// the generic mat-vec kernel, or its 2-row Q4_0 variant if nc
-static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx, bool nc) {
-    ggml_tensor * op = ctx->node(idx);
-
+// encode the mat-vec op (or its 2-row Q4_0 variant if nc) into dst; the store adds res when dst is a fused ADD.
+// with norm (a fused RMS_NORM + MUL) the kernel reads the norm input row and normalizes it with the weight w
+static void ggml_metal_op_mul_mat_mv_encode(
+        ggml_metal_op_t     ctx,
+        const ggml_tensor * op,
+        bool                nc,
+        const ggml_tensor * dst,
+        const ggml_tensor * res,
+        const ggml_tensor * norm,
+        const ggml_tensor * w) {
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
 
@@ -3685,17 +3691,9 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx, bool nc) {
     const int16_t r2 = ne12/ne02;
     const int16_t r3 = ne13/ne03;
 
-    // the mat-vec store adds the residual when the table fuses the ADD after this mat-mul
-    const int  n_fuse   = !nc && ggml_metal_mul_mat_mv_use_add(op) ? ggml_metal_op_try_fusion(ctx, idx, GGML_METAL_FUSION_MUL_MAT_ADD) : 1;
-    const bool fuse_add = n_fuse > 1;
-    if (fuse_add) {
-        ggml_metal_op_fusion_concurrency(ctx, idx, n_fuse);
-    }
+    const bool add = dst != op;
 
-    const ggml_tensor * dst = fuse_add ? ctx->node(idx + 1) : op;
-    const ggml_tensor * res = fuse_add ? ggml_metal_mul_mat_add_residual(op, dst) : dst;
-
-    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, nc, fuse_add);
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, nc, add, norm != nullptr);
 
     const int nr0 = pipeline.nr0;
     const int nr1 = pipeline.nr1;
@@ -3723,14 +3721,18 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx, bool nc) {
         /*.nr0  =*/ nr0,
         /*.r2   =*/ r2,
         /*.r3   =*/ r3,
+        /*.eps  =*/ norm ? ggml_get_op_params_f32(norm, 0) : 0.0f,
     };
+
+    const ggml_tensor * src1 = norm ? norm->src[0] : op->src[1];
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(src1),       2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),        3);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(res),        4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(w ? w : src1), 5);
 
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
@@ -3742,6 +3744,23 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx, bool nc) {
     } else {
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne01 + nr0*nsg - 1)/(nr0*nsg)), ((ne11 + nr1 - 1)/nr1), ne12*ne13, 32, nsg, 1);
     }
+}
+
+// the generic mat-vec kernel, or its 2-row Q4_0 variant if nc
+static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx, bool nc) {
+    ggml_tensor * op = ctx->node(idx);
+
+    // the mat-vec store adds the residual when the table fuses the ADD after this mat-mul
+    const int  n_fuse   = !nc && ggml_metal_mul_mat_mv_use_add(op) ? ggml_metal_op_try_fusion(ctx, idx, GGML_METAL_FUSION_MUL_MAT_ADD) : 1;
+    const bool fuse_add = n_fuse > 1;
+    if (fuse_add) {
+        ggml_metal_op_fusion_concurrency(ctx, idx, n_fuse);
+    }
+
+    const ggml_tensor * dst = fuse_add ? ctx->node(idx + 1) : op;
+    const ggml_tensor * res = fuse_add ? ggml_metal_mul_mat_add_residual(op, dst) : dst;
+
+    ggml_metal_op_mul_mat_mv_encode(ctx, op, nc, dst, res, nullptr, nullptr);
 
     return n_fuse;
 }
@@ -5727,13 +5746,56 @@ static int ggml_metal_op_cont_fwht(ggml_metal_op_t ctx, int idx) {
 
 // true if the encoder can elide the nodes that the fusion table matched for the norm at idx: the consumer checks that
 // need the graph, for the patterns whose table check leaves them to the encoder
+// RMS_NORM + MUL + MUL_MAT x N: a gate/up pair that the decode SWIGLU fusion takes right after is left to that fusion
+static bool ggml_metal_op_rms_norm_mul_mv_elidable(ggml_metal_op_t ctx, int idx, const ggml_metal_fusion * fusion) {
+    const int n = fusion->n_ops;
+
+    if (n == 4 && idx + 4 < ctx->n_nodes()) {
+        const ggml_tensor * a   = ctx->node(idx + 2);
+        const ggml_tensor * b   = ctx->node(idx + 3);
+        const ggml_tensor * glu = ctx->node(idx + 4);
+
+        const bool pair = glu->op == GGML_OP_GLU &&
+            ((glu->src[0] == a && glu->src[1] == b) || (glu->src[0] == b && glu->src[1] == a));
+
+        if (pair && ggml_metal_should_fuse_mul_mat_glu(glu->src[1], glu->src[0], glu)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 static bool ggml_metal_op_norm_fusion_elidable(ggml_metal_op_t ctx, int idx, const ggml_metal_fusion * fusion) {
     bool write_norm = false;
     switch (fusion->id) {
-        case GGML_METAL_FUSION_RMS_NORM_FWHT: return ggml_metal_op_rms_norm_fwht_elidable(ctx, idx, &write_norm);
-        case GGML_METAL_FUSION_RMS_NORM_GATE: return ggml_metal_op_norm_gate_elidable(ctx, idx);
-        default:                              return true;
+        case GGML_METAL_FUSION_RMS_NORM_FWHT:   return ggml_metal_op_rms_norm_fwht_elidable(ctx, idx, &write_norm);
+        case GGML_METAL_FUSION_RMS_NORM_GATE:   return ggml_metal_op_norm_gate_elidable(ctx, idx);
+        case GGML_METAL_FUSION_RMS_NORM_MUL_MV: return ggml_metal_op_rms_norm_mul_mv_elidable(ctx, idx, fusion);
+        default:                                return true;
     }
+}
+
+// RMS_NORM + MUL + MUL_MAT x N: encode only the N mat-vecs; each one normalizes the norm input with the norm weight
+static int ggml_metal_op_rms_norm_mul_mv(ggml_metal_op_t ctx, int idx, const ggml_metal_fusion * fusion) {
+    const int n_fuse = fusion->n_ops;
+
+    const ggml_tensor * norm = ctx->node(idx);
+    const ggml_tensor * mul  = ctx->node(idx + 1);
+
+    ggml_metal_op_fusion_concurrency(ctx, idx, n_fuse);
+
+    for (int i = 2; i < n_fuse; ++i) {
+        const ggml_tensor * mm = ctx->node(idx + i);
+
+        ggml_metal_op_mul_mat_mv_encode(ctx, mm, false, mm, mm, norm, mul->src[1]);
+    }
+
+    if (ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
+        GGML_LOG_DEBUG("%s: fuse: RMS_NORM + MUL + %d MUL_MAT\n", __func__, n_fuse - 2);
+    }
+
+    return n_fuse;
 }
 
 // the longest fusion for the norm at idx that the table matches and the encoder can elide, or nullptr
@@ -5798,6 +5860,11 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
     // d[2] = add(d[1], c)
     if (use_fusion) {
         const ggml_metal_fusion * fusion = ggml_metal_op_norm_fusion(ctx, idx);
+
+        if (fusion && fusion->id == GGML_METAL_FUSION_RMS_NORM_MUL_MV) {
+            ctx->count_fusions(fusion);
+            return ggml_metal_op_rms_norm_mul_mv(ctx, idx, fusion);
+        }
 
         if (fusion && fusion->id == GGML_METAL_FUSION_RMS_NORM_FWHT) {
             const int n_fwht = ggml_metal_op_rms_norm_fwht(ctx, idx);
