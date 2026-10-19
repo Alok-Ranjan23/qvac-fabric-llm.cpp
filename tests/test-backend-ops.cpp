@@ -4306,12 +4306,14 @@ static int64_t backend_fusion_label_count(ggml_backend_t backend, const char * l
     std::vector<uint64_t>     counts(n, 0);
     api_stats_get(finfo, labels.data(), counts.data(), n);
 
+    // several patterns may share a label (e.g. with and without an empty RESHAPE), so sum them
+    int64_t total = -1;
     for (int i = 0; i < n; i++) {
         if (strcmp(labels[i], label) == 0) {
-            return (int64_t) counts[i];
+            total = (total < 0 ? 0 : total) + (int64_t) counts[i];
         }
     }
-    return -1;
+    return total;
 }
 
 // GGML_OP_RMS_NORM + GGML_OP_MUL + SILU gate (the gated norm of the gated delta net output)
