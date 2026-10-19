@@ -498,9 +498,122 @@ static bool ggml_metal_fusion_check_rms_norm_mul_mv(
     return true;
 }
 
+// RMS_NORM + MUL + ROPE (+ SET_ROWS): rows normalized over their width, weighted and rotated over the full width, as the
+// per-head Q/K norms of Qwen3; with SET_ROWS, the rotated rows are written straight into the cache rows given by the
+// indices, through a contiguous view of the ROPE output (unsafe = true; the consumers are checked on the graph)
+static bool ggml_metal_fusion_check_rms_norm_rope(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_metal_device_props * props,
+              ggml_metal_fusion_mode   mode) {
+    GGML_UNUSED(props);
+
+    const int n_ops = fusion->n_ops;
+    GGML_ASSERT(n_ops == 3 || n_ops == 4);
+
+    const ggml_tensor * norm = nodes[0];
+    const ggml_tensor * mul  = nodes[1];
+    const ggml_tensor * rope = nodes[2];
+    const ggml_tensor * x    = norm->src[0];
+    const ggml_tensor * w    = mul->src[1];
+
+    if (mul->src[0] != norm || rope->src[0] != mul ||
+        x->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || rope->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(norm, mul) || !ggml_are_same_shape(mul, rope)) {
+        return false;
+    }
+
+    // rows up to 256 wide, see kernel_rms_norm_rope
+    const int64_t ne0 = norm->ne[0];
+    if (ne0 % 2 != 0 || ne0 > 256 || x->nb[0] != sizeof(float) || x->ne[3] != 1 || rope->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    if (w->type != GGML_TYPE_F32 || w->ne[0] != ne0 || ggml_nrows(w) != 1 || !ggml_is_contiguous(w)) {
+        return false;
+    }
+
+    // NEOX or normal rotation over the full row
+    const int32_t * rp = (const int32_t *) rope->op_params;
+    const int rmode  = rp[2];
+    const int n_dims = rp[1];
+    if ((rmode != GGML_ROPE_TYPE_NEOX && rmode != GGML_ROPE_TYPE_NORMAL) || n_dims != ne0) {
+        return false;
+    }
+
+    const ggml_tensor * pos = rope->src[1];
+    const ggml_tensor * ff  = rope->src[2];
+    if (pos->type != GGML_TYPE_I32 || pos->ne[0] != rope->ne[2] || !ggml_is_contiguous(pos)) {
+        return false;
+    }
+    if (ff && (ff->type != GGML_TYPE_F32 || ff->ne[0] < ne0/2 || !ggml_is_contiguous(ff))) {
+        return false;
+    }
+
+    if (n_ops == 3) {
+        // each row is read whole before it is written, so only an exact alias of the input is safe
+        return mode != GGML_METAL_FUSION_FULL || (!ggml_metal_fusion_partial_overlap(x, rope) && !ggml_metal_fusion_overlap(w, rope));
+    }
+
+    // SET_ROWS of the rotated rows, one dst row per token
+    const ggml_tensor * sr  = nodes[3];
+    const ggml_tensor * src = sr->src[0];
+    const ggml_tensor * ids = sr->src[1];
+
+    if (src != rope && (src->view_src != rope || src->view_offs != 0)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(rope) || !ggml_is_contiguous(src) || ggml_nelements(src) != ggml_nelements(rope) ||
+        src->ne[0] != ne0*rope->ne[1] || src->ne[1] != rope->ne[2] || src->ne[2] != 1 || src->ne[3] != 1) {
+        return false;
+    }
+    if ((ids->type != GGML_TYPE_I64 && ids->type != GGML_TYPE_I32) || ids->ne[0] != src->ne[1] ||
+        ggml_nrows(ids) != 1 || !ggml_is_contiguous(ids)) {
+        return false;
+    }
+    if ((sr->type != GGML_TYPE_F16 && sr->type != GGML_TYPE_F32) || sr->ne[0] != src->ne[0] ||
+        sr->nb[0] != ggml_type_size(sr->type) || sr->ne[2] != 1 || sr->ne[3] != 1) {
+        return false;
+    }
+
+    return mode != GGML_METAL_FUSION_FULL || !ggml_metal_fusion_overlap(x, sr);
+}
+
 // the norm and the MUL are elided, so the N mat-vecs must be their only consumers
 static bool ggml_metal_fusion_check_graph_rms_norm_mul_mv(const ggml_metal_fusion * fusion, const ggml_cgraph * gf, const int * idxs) {
     return ggml_can_fuse_subgraph_ext(gf, idxs, fusion->n_ops, fusion->ops, idxs + 2, fusion->n_ops - 2);
+}
+
+// the norm, the MUL and, with SET_ROWS, the ROPE and any view between ROPE and SET_ROWS are elided, so none of them may
+// have consumers outside the group
+static bool ggml_metal_fusion_check_graph_rms_norm_rope(const ggml_metal_fusion * fusion, const ggml_cgraph * gf, const int * idxs) {
+    if (fusion->n_ops == 3) {
+        return ggml_can_fuse_subgraph_ext(gf, idxs, 3, fusion->ops, idxs + 2, 1);
+    }
+
+    const ggml_tensor * rope = gf->nodes[idxs[2]];
+    const ggml_tensor * sr   = gf->nodes[idxs[3]];
+
+    if (sr->src[0] == rope) {
+        return ggml_can_fuse_subgraph_ext(gf, idxs, 4, fusion->ops, idxs + 3, 1);
+    }
+
+    // the SET_ROWS reads the ROPE through a view, which is not a node of the matched sequence
+    int gi_view = -1;
+    for (int i = idxs[2] + 1; i < idxs[3]; ++i) {
+        if (gf->nodes[i] == sr->src[0]) {
+            gi_view = i;
+            break;
+        }
+    }
+    if (gi_view < 0) {
+        return false;
+    }
+
+    const ggml_op ops[5]  = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, sr->src[0]->op, GGML_OP_SET_ROWS };
+    const int     gis[5]  = { idxs[0], idxs[1], idxs[2], gi_view, idxs[3] };
+
+    return ggml_can_fuse_subgraph_ext(gf, gis, 5, ops, &gis[4], 1);
 }
 
 // true if CPY a copies an f32 view of one tensor into an f32 view of another and can start a batch
@@ -600,6 +713,9 @@ static const ggml_op ops_mul_mat_add[] = { GGML_OP_MUL_MAT, GGML_OP_ADD };
 
 static const ggml_op ops_rms_norm_mul_mv[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
 
+// the view between ROPE and SET_ROWS is not a node of the matched sequence
+static const ggml_op ops_rms_norm_rope[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_SET_ROWS };
+
 // a batch of n copies reads the first n ops
 static const ggml_op ops_cpy_batch[GGML_METAL_CPY_BATCH_MAX] = {
     GGML_OP_CPY, GGML_OP_CPY, GGML_OP_CPY, GGML_OP_CPY, GGML_OP_CPY, GGML_OP_CPY, GGML_OP_CPY, GGML_OP_CPY,
@@ -630,6 +746,8 @@ static const ggml_metal_fusion ggml_metal_fusions[] = {
     { GGML_METAL_FUSION_RMS_NORM_MUL_MV, ops_rms_norm_mul_mv, 5, true, ggml_metal_fusion_check_rms_norm_mul_mv, ggml_metal_fusion_check_graph_rms_norm_mul_mv },
     { GGML_METAL_FUSION_RMS_NORM_MUL_MV, ops_rms_norm_mul_mv, 4, true, ggml_metal_fusion_check_rms_norm_mul_mv, ggml_metal_fusion_check_graph_rms_norm_mul_mv },
     { GGML_METAL_FUSION_RMS_NORM_MUL_MV, ops_rms_norm_mul_mv, 3, true, ggml_metal_fusion_check_rms_norm_mul_mv, ggml_metal_fusion_check_graph_rms_norm_mul_mv },
+    { GGML_METAL_FUSION_RMS_NORM_ROPE,   ops_rms_norm_rope,   4, true, ggml_metal_fusion_check_rms_norm_rope, ggml_metal_fusion_check_graph_rms_norm_rope },
+    { GGML_METAL_FUSION_RMS_NORM_ROPE,   ops_rms_norm_rope,   3, true, ggml_metal_fusion_check_rms_norm_rope, ggml_metal_fusion_check_graph_rms_norm_rope },
     // longest batch first, so ggml_metal_fusion_next checks no shorter batch once one matches
     { GGML_METAL_FUSION_CPY_BATCH,    ops_cpy_batch,       16, true,  ggml_metal_fusion_check_cpy_batch },
     { GGML_METAL_FUSION_CPY_BATCH,    ops_cpy_batch,       15, true,  ggml_metal_fusion_check_cpy_batch },
