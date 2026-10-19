@@ -4057,6 +4057,18 @@ struct test_rms_norm_mul_mul : public test_case {
         return VARS_TO_STR5(ne, eps, gated, proj, v);
     }
 
+    // WebGPU stages F32 MUL_MAT operands in F16 workgroup memory, so use its F16 NMSE floor.
+    // See https://github.com/ggml-org/llama.cpp/pull/22976 for the F16 floor.
+    double max_nmse_err(ggml_backend_t backend) override {
+        if (gated && proj) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+            if (strcmp(ggml_backend_reg_name(reg), "WebGPU") == 0) {
+                return std::max(test_case::max_nmse_err(backend), 1e-6);
+            }
+        }
+        return test_case::max_nmse_err(backend);
+    }
+
     test_rms_norm_mul_mul(std::array<int64_t, 4> ne = {128, 48, 9, 1}, float eps = 1e-6f, bool gated = true, bool proj = false, bool v = false)
         : ne(ne), eps(eps), gated(gated), proj(proj), v(v) {}
 
