@@ -579,9 +579,30 @@ static bool ggml_metal_fusion_check_rms_norm_rope(
     return mode != GGML_METAL_FUSION_FULL || !ggml_metal_fusion_overlap(x, sr);
 }
 
-// the norm and the MUL are elided, so the N mat-vecs must be their only consumers
+// the norm and the MUL are elided, so the N mat-vecs must be their only consumers. a gate/up pair that feeds one SWIGLU
+// is left to the decode gate/up/SWIGLU fusion when it has a kernel for the type: packing the pair with the norm here
+// would let the graph optimizer place other nodes between the pair and the GLU, which that fusion needs adjacent
 static bool ggml_metal_fusion_check_graph_rms_norm_mul_mv(const ggml_metal_fusion * fusion, const ggml_cgraph * gf, const int * idxs) {
-    return ggml_can_fuse_subgraph_ext(gf, idxs, fusion->n_ops, fusion->ops, idxs + 2, fusion->n_ops - 2);
+    if (!ggml_can_fuse_subgraph_ext(gf, idxs, fusion->n_ops, fusion->ops, idxs + 2, fusion->n_ops - 2)) {
+        return false;
+    }
+
+    if (fusion->n_ops != 4) {
+        return true;
+    }
+
+    const ggml_tensor * a = gf->nodes[idxs[2]];
+    const ggml_tensor * b = gf->nodes[idxs[3]];
+
+    for (int i = idxs[3] + 1; i < gf->n_nodes && i <= idxs[3] + 32; ++i) {
+        const ggml_tensor * glu = gf->nodes[i];
+        if (glu->op == GGML_OP_GLU && ((glu->src[0] == a && glu->src[1] == b) || (glu->src[0] == b && glu->src[1] == a))) {
+            return !(ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && a->src[0]->type == b->src[0]->type &&
+                     ggml_metal_mul_mv_glu_type_ok(a->src[0]->type));
+        }
+    }
+
+    return true;
 }
 
 // the norm, the MUL and, with SET_ROWS, the ROPE and any view between ROPE and SET_ROWS are elided, so none of them may

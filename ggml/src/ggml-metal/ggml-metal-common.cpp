@@ -145,6 +145,22 @@ bool ggml_metal_mul_mat_mv_may_add(const struct ggml_tensor * op) {
         ggml_get_op_params_i32(op, 1) != GGML_HINT_SRC0_IS_HADAMARD;
 }
 
+bool ggml_metal_mul_mv_glu_type_ok(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_PQ2_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool ggml_metal_mul_mat_mv_use_add(const struct ggml_tensor * op) {
     return ggml_metal_mul_mat_mv_may_add(op) && op->src[1]->ne[1] == 1;
 }

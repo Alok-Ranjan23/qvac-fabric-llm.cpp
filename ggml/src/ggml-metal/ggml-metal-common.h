@@ -85,6 +85,8 @@ bool ggml_metal_mul_mat_use_nc(const struct ggml_tensor * op);
 bool ggml_metal_mul_mat_mv_may_add(const struct ggml_tensor * op);
 // true if mat-mul op runs on a mat-vec kernel that can add a residual in its store (one src1 row)
 bool ggml_metal_mul_mat_mv_use_add(const struct ggml_tensor * op);
+// true if the decode gate/up/SWIGLU fusion has a mat-vec kernel for src0 type
+bool ggml_metal_mul_mv_glu_type_ok(enum ggml_type type);
 // the f32 operand that f32 add sums with mat-mul mm, if mm is exactly one of its operands and the other one is not a
 // weight (a bias), else NULL. it reads no shapes, so it gives the same answer for every batch size
 const struct ggml_tensor * ggml_metal_mul_mat_add_operand(const struct ggml_tensor * mm, const struct ggml_tensor * add);

@@ -2072,22 +2072,6 @@ static int ggml_metal_op_try_topk_moe(ggml_metal_op_t ctx, int idx) {
     return n_fuse;
 }
 
-static bool ggml_metal_mul_mv_glu_type_ok(enum ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_F32:
-        case GGML_TYPE_F16:
-        case GGML_TYPE_BF16:
-        case GGML_TYPE_Q8_0:
-        case GGML_TYPE_PQ2_0:
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q5_K:
-            return true;
-        default:
-            return false;
-    }
-}
-
 static bool ggml_metal_mul_mv_glu_decode_ok(const ggml_tensor * mm) {
     const ggml_tensor * src0 = mm->src[0];
     const ggml_tensor * src1 = mm->src[1];
@@ -5744,28 +5728,6 @@ static int ggml_metal_op_cont_fwht(ggml_metal_op_t ctx, int idx) {
     return GGML_METAL_CONT_FWHT_N_OPS;
 }
 
-// true if the encoder can elide the nodes that the fusion table matched for the norm at idx: the consumer checks that
-// need the graph, for the patterns whose table check leaves them to the encoder
-// RMS_NORM + MUL + MUL_MAT x N: a gate/up pair that the decode SWIGLU fusion takes right after is left to that fusion
-static bool ggml_metal_op_rms_norm_mul_mv_elidable(ggml_metal_op_t ctx, int idx, const ggml_metal_fusion * fusion) {
-    const int n = fusion->n_ops;
-
-    if (n == 4 && idx + 4 < ctx->n_nodes()) {
-        const ggml_tensor * a   = ctx->node(idx + 2);
-        const ggml_tensor * b   = ctx->node(idx + 3);
-        const ggml_tensor * glu = ctx->node(idx + 4);
-
-        const bool pair = glu->op == GGML_OP_GLU &&
-            ((glu->src[0] == a && glu->src[1] == b) || (glu->src[0] == b && glu->src[1] == a));
-
-        if (pair && ggml_metal_should_fuse_mul_mat_glu(glu->src[1], glu->src[0], glu)) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
 // RMS_NORM + MUL + ROPE (+ SET_ROWS): one dispatch normalizes, weights and rotates the rows, and writes them to the ROPE
 // output or, with SET_ROWS, straight into the indexed dst rows
 static int ggml_metal_op_rms_norm_rope(ggml_metal_op_t ctx, int idx, const ggml_metal_fusion * fusion) {
@@ -5848,13 +5810,14 @@ static int ggml_metal_op_rms_norm_rope(ggml_metal_op_t ctx, int idx, const ggml_
     return n_fuse;
 }
 
+// true if the encoder can elide the nodes that the fusion table matched for the norm at idx: the consumer checks that
+// need the graph, for the patterns whose table check leaves them to the encoder
 static bool ggml_metal_op_norm_fusion_elidable(ggml_metal_op_t ctx, int idx, const ggml_metal_fusion * fusion) {
     bool write_norm = false;
     switch (fusion->id) {
-        case GGML_METAL_FUSION_RMS_NORM_FWHT:   return ggml_metal_op_rms_norm_fwht_elidable(ctx, idx, &write_norm);
-        case GGML_METAL_FUSION_RMS_NORM_GATE:   return ggml_metal_op_norm_gate_elidable(ctx, idx);
-        case GGML_METAL_FUSION_RMS_NORM_MUL_MV: return ggml_metal_op_rms_norm_mul_mv_elidable(ctx, idx, fusion);
-        default:                                return true;
+        case GGML_METAL_FUSION_RMS_NORM_FWHT: return ggml_metal_op_rms_norm_fwht_elidable(ctx, idx, &write_norm);
+        case GGML_METAL_FUSION_RMS_NORM_GATE: return ggml_metal_op_norm_gate_elidable(ctx, idx);
+        default:                              return true;
     }
 }
 
