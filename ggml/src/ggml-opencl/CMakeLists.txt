@@ -233,6 +233,7 @@ set(GGML_OPENCL_KERNELS
     transpose
     concat
     gru
+    zero_upsample
     tsembd
     upscale
     tanh
