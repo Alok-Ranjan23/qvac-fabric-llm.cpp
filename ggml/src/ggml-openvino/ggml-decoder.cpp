@@ -965,6 +965,9 @@ ov::PartialShape GgmlOvDecoder::get_graph_input_shape(const ggml_tensor * op,
         input_shape = m_is_static ? ov::PartialShape{1, 1, input->ne[1], m_prefill_chunk_size} :
                                     ov::PartialShape{1, 1, -1, -1};
 
+    } else if (is_inp_scale_rows(input, op)) {
+        input_shape = ov::PartialShape{1, 1, m_is_static ? (m_is_prefill ? m_prefill_chunk_size : 1) : -1, 1};
+
     } else if (is_inp_mask(input, op)) {
         // mask
         if (m_is_static) {
@@ -1935,6 +1938,10 @@ void GgmlOvDecoder::compute_node_dynamic_dims() {
                     m_node_dynamic_dims[src] = 0;
                     continue;
                 }
+                if (is_inp_scale_rows(src, node)) {
+                    m_node_dynamic_dims[src] = 1;
+                    continue;
+                }
                 if (node->op == GGML_OP_VIEW && src->op == GGML_OP_NONE && !is_stateful() && !m_model_is_splitted) {
                     m_node_dynamic_dims[src] = 1;
                     continue;
@@ -2141,6 +2148,7 @@ void GgmlOvDecoder::compute_node_dynamic_dims() {
         case GGML_OP_DIAG:
         case GGML_OP_TRI:
         case GGML_OP_REPEAT:
+        case GGML_OP_DUP:
         // Shape-preserving elementwise ops: the dynamic dim is unchanged from src[0].
         // DIV/CLAMP are used in the MoE routing-weight normalization
         // (sum_rows -> clamp -> div). If they are left untracked here the dynamic

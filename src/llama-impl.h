@@ -31,6 +31,13 @@ void llama_log_callback_default(ggml_log_level level, const char * text, void * 
 #define LLAMA_LOG_DEBUG(...) llama_log_internal(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
 #define LLAMA_LOG_CONT(...)  llama_log_internal(GGML_LOG_LEVEL_CONT , __VA_ARGS__)
 
+// Debug-only logging macro that's only enabled in debug builds at compile time
+#ifndef NDEBUG
+#define LLAMA_LOG_CMAKE_DEBUG(...) LLAMA_LOG_DEBUG(__VA_ARGS__)
+#else
+#define LLAMA_LOG_CMAKE_DEBUG(...)
+#endif
+
 //
 // helpers
 //
@@ -73,6 +80,9 @@ static inline ggml_tensor * llama_mul_mat_hadamard(
 
     return res;
 }
+
+// Prefetch the host pages needed to gather these rows.
+void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows);
 
 struct time_meas {
     time_meas(int64_t & t_acc, bool disable = false);

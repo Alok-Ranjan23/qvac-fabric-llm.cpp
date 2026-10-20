@@ -12,10 +12,23 @@
 #include <set>
 #include <functional>
 #include <map>
+#include <tuple>
+#include <unordered_map>
 
 struct ggml_cgraph;
 struct ggml_context;
 struct ggml_tensor;
+
+// Activation-side transform for a folded model weight.
+struct llama_hadamard_transform {
+    ggml_tensor * rot;
+    ggml_tensor * signs; // nullptr for identity sign mode
+    // Permute tiled [hd, nk, rep] activations to grouped [hd, rep, nk] order.
+    int64_t perm_hd  = 0;
+    int64_t perm_nk  = 0;
+    int64_t perm_rep = 0;
+};
+using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_hadamard_transform>;
 
 struct llama_cparams;
 struct llama_layer;
@@ -60,6 +73,7 @@ enum llm_ffn_op_type : int {
     LLM_FFN_RELU_SQR,
     LLM_FFN_SWIGLU,
     LLM_FFN_GEGLU,
+    LLM_FFN_GEGLU_ERF,
     LLM_FFN_REGLU,
     LLM_FFN_SWIGLU_OAI_MOE,
     LLM_FFN_SITU,           // kimi-k3
@@ -134,8 +148,14 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * tokens = nullptr; // I32 [n_batch]
-    ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
+    ggml_tensor * tokens       = nullptr; // I32 [n_batch]
+    ggml_tensor * embd         = nullptr; // F32 [n_embd, n_batch]
+    ggml_tensor * mixed_tokens = nullptr; // I32 [n_tok_rows], mixed path: ids of the token rows
+    ggml_tensor * mixed_slots  = nullptr; // I64 [n_tok_rows], mixed path: batch index of the token rows
+    ggml_tensor * mixed_embd   = nullptr; // F32 [n_embd, n_batch], mixed path: embd rows, token rows are overwritten
+    ggml_tensor * scale_rows   = nullptr; // F32 [1, n_batch], per-row scale: scale_tok for token rows, 1 for embd rows
+
+    float scale_tok = 1.0f;
 
     const int64_t n_embd = 0;
 };
@@ -787,6 +807,8 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_hadamard_rotations * hadamard_rotations;
+    const llama_hadamard_rotations * hadamard_inverses;
 
     const llama_prec_policy * prec_policy = nullptr;
 
@@ -823,6 +845,7 @@ struct llm_graph_params {
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
             ubatch.n_seqs       == other.ubatch.n_seqs &&
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
+            ubatch.is_mixed()   == other.ubatch.is_mixed() &&
             (
                 (!ubatch.token && !other.ubatch.token) ||
                 (!ubatch.embd  && !other.ubatch.embd)  ||
@@ -871,6 +894,10 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        if (cparams.draft_vocab != other.cparams.draft_vocab) {
             return false;
         }
 
@@ -1029,6 +1056,8 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_hadamard_rotations * hadamard_rotations;
+    const llama_hadamard_rotations * hadamard_inverses;
 
     const llama_prec_policy * prec_policy;
 
@@ -1040,6 +1069,10 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    // activation transforms of this graph by (input, rot, signs, perm), shared by the folded weights that read the same input
+    using hadamard_act_key = std::tuple<const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int64_t, int64_t, int64_t>;
+    mutable std::map<hadamard_act_key, ggml_tensor *> hadamard_acts;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
@@ -1053,6 +1086,15 @@ struct llm_graph_context {
     ggml_tensor * build_cvec(
              ggml_tensor * cur,
                      int   il) const;
+
+    ggml_tensor * build_hadamard_inverse_after_lookup(
+              ggml_tensor * cur,
+        const ggml_tensor * table) const;
+
+    // the activation-side transform of a folded weight, built once per input
+    ggml_tensor * build_hadamard_activation(
+                     ggml_tensor * cur,
+        const llama_hadamard_transform & t) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
@@ -1166,7 +1208,8 @@ struct llm_graph_context {
     // inputs
     //
 
-    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    // tok_scale: applied to token rows only
+    ggml_tensor * build_inp_embd(ggml_tensor * tok_embd, float tok_scale = 1.0f) const;
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;

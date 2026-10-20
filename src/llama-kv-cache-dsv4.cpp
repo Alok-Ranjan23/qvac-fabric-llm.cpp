@@ -83,6 +83,7 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
     if (!dsv4_ubatch_has_coupled(ubatch)) {
         return ubatch;
     }
+    ASSERT_EMBD_OR_TOKEN(ubatch);
     if (ubatch.embd) {
         throw std::runtime_error("DSV4 coupled embedding ubatches are not supported");
     }
@@ -164,6 +165,7 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
         /*.seq_id_unq   =*/ data->seq_id_unq.data(),
         /*.seq_idx      =*/ data->seq_idx.data(),
         /*.output       =*/ data->output.data(),
+        /*.type         =*/ nullptr,
         /*.data         =*/ data,
     };
 
@@ -1566,6 +1568,14 @@ llama_pos llama_kv_cache_dsv4::seq_pos_max(llama_seq_id seq_id) const {
     }
 
     return kv_raw->seq_pos_max(seq_id);
+}
+
+uint32_t llama_kv_cache_dsv4::seq_token_count(llama_seq_id seq_id) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+        return 0;
+    }
+
+    return kv_raw->seq_token_count(seq_id);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdown() const {
