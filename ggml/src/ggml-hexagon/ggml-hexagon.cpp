@@ -267,8 +267,10 @@ enum ggml_hexagon_tensor_flags {
 };
 
 static bool ggml_hexagon_is_bf16_weight(const ggml_tensor * t) {
+    // Both copies must fit after buffer alignment, before computing either padded size.
     return t->type == GGML_TYPE_BF16 && t->op == GGML_OP_NONE && !t->view_src &&
-           ggml_is_contiguous(t) && ggml_is_matrix(t) && t->ne[0] % 32 == 0;
+           ggml_is_contiguous(t) && ggml_is_matrix(t) && t->ne[0] % 32 == 0 &&
+           ggml_nbytes(t) <= hex_align_down(SIZE_MAX / 2, 128);
 }
 
 static ggml_type ggml_hexagon_weight_type(const ggml_tensor * t) {
