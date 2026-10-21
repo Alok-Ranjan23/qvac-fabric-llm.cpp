@@ -50,17 +50,18 @@ static void batch_add_seq(llama_batch & batch, const std::vector<int32_t> & toke
     }
 }
 
-static bool batch_decode(llama_context * ctx, llama_batch & batch, float * output, int n_seq, int n_embd_out, int embd_norm, bool quiet) {
+static bool batch_decode(llama_context * ctx, llama_batch & batch, float * output, int n_seq, int n_embd_out, int embd_norm, bool benchmark) {
     const enum llama_pooling_type pooling_type = llama_pooling_type(ctx);
 
     // clear previous kv_cache values (irrelevant for embeddings)
     llama_memory_clear(llama_get_memory(ctx), true);
 
     // run model
-    if (!quiet) {
+    if (!benchmark) {
         LOG_INF("%s: n_tokens = %d, n_seq = %d\n", __func__, batch.n_tokens, n_seq);
     }
-    if (llama_decode(ctx, batch) != 0) {
+    const int ret = llama_decode(ctx, batch);
+    if (ret < 0 || (benchmark && ret != 0)) {
         LOG_ERR("%s : failed to process\n", __func__);
         return false;
     }

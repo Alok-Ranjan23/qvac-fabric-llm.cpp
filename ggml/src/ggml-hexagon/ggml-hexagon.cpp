@@ -98,6 +98,7 @@ static int    opt_verbose = 0;
 static int    opt_profile = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
 static bool   opt_hostbuf = false;
 static bool   opt_dma64   = false;
+static bool   opt_bf16    = true;
 
 static int    opt_mm_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
 static int    opt_fa_select = 2; // 2 = HMX -> HVX -> CPU, 1 = HVX -> CPU, 0 = CPU (unsupported)
@@ -271,7 +272,10 @@ static bool ggml_hexagon_is_bf16_weight(const ggml_tensor * t) {
 }
 
 static ggml_type ggml_hexagon_weight_type(const ggml_tensor * t) {
-    return t->type == GGML_TYPE_BF16 ? GGML_TYPE_F16 : t->type;
+    if (opt_bf16 && ggml_hexagon_is_bf16_weight(t) && (!t->buffer || !ggml_backend_buffer_is_host(t->buffer))) {
+        return GGML_TYPE_F16;
+    }
+    return t->type;
 }
 
 static size_t ggml_hexagon_bf16_mirror_offset(const ggml_tensor * t) {
@@ -734,6 +738,16 @@ struct ggml_hexagon_shared_buffer {
     }
 };
 
+static void ggml_hexagon_invalidate_bf16_mirror(const ggml_tensor * tensor) {
+    // Uploads through a view also change the source weight.
+    for (; tensor; tensor = tensor->view_src) {
+        auto extra = static_cast<ggml_hexagon_tensor_extra *>(tensor->extra);
+        if (extra) {
+            extra->flags &= ~GGML_HEXAGON_TENSOR_BF16_F16;
+        }
+    }
+}
+
 static void ggml_hexagon_invalidate_bf16_mirrors(ggml_backend_buffer_t buffer) {
     auto sbuf = static_cast<ggml_hexagon_shared_buffer *>(buffer->context);
     for (auto * extra : sbuf->tensor_extra) {
@@ -748,6 +762,7 @@ static void ggml_hexagon_convert_bf16_weight(const ggml_tensor * tensor) {
     }
 
     GGML_ASSERT(ggml_hexagon_is_bf16_weight(tensor));
+    HEX_VERBOSE("ggml-hex: BF16 weight %s : F16 mirror %zu bytes\n", tensor->name, ggml_nbytes(tensor));
     const auto * src = static_cast<const ggml_bf16_t *>(tensor->data);
     auto * dst = reinterpret_cast<ggml_fp16_t *>(static_cast<uint8_t *>(tensor->data) +
                                                ggml_hexagon_bf16_mirror_offset(tensor));
@@ -2051,7 +2066,7 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
     if ((extra->flags & GGML_HEXAGON_TENSOR_REPACK) == 0) {
         memcpy((char *) tensor->data + offset, data, size);
         if (tensor->type == GGML_TYPE_BF16) {
-            ggml_hexagon_invalidate_bf16_mirrors(buffer);
+            ggml_hexagon_invalidate_bf16_mirror(tensor);
         }
         return;
     }
@@ -2185,7 +2200,7 @@ static void ggml_backend_hexagon_buffer_set_tensor_2d(ggml_backend_buffer_t buff
             memcpy((uint8_t *) tensor->data + offset + i * stride_tensor, (const uint8_t *) data + i * stride_data, size);
         }
         if (tensor->type == GGML_TYPE_BF16) {
-            ggml_hexagon_invalidate_bf16_mirrors(buffer);
+            ggml_hexagon_invalidate_bf16_mirror(tensor);
         }
         return;
     }
@@ -2387,7 +2402,7 @@ static size_t ggml_backend_hexagon_buffer_type_get_alignment(ggml_backend_buffer
 }
 
 static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * t) {
-    if (ggml_hexagon_is_bf16_weight(t) && !ggml_backend_buft_is_host(buft)) {
+    if (opt_bf16 && ggml_hexagon_is_bf16_weight(t) && !ggml_backend_buft_is_host(buft)) {
         // Keep BF16 bytes for readback and cache F16 weights after them for HTP.
         return ggml_hexagon_bf16_mirror_offset(t) + ggml_nbytes(t);
     }
@@ -2574,7 +2589,7 @@ struct ggml_hexagon_opbatch {
         auto extra = (ggml_hexagon_tensor_extra *) t->extra;
         auto sbuf  = static_cast<ggml_hexagon_shared_buffer *>(t->buffer->context);
 
-        if (t->type == GGML_TYPE_BF16) {
+        if (ggml_hexagon_weight_type(t) != t->type) {
             ggml_hexagon_convert_bf16_weight(t);
         }
 
@@ -2598,7 +2613,7 @@ struct ggml_hexagon_opbatch {
 
         uint64_t t_offset = (uint8_t *) t->data - sbuf->base();
         size_t   t_size   = ggml_nbytes(t);
-        if (t->type == GGML_TYPE_BF16) {
+        if (ggml_hexagon_weight_type(t) != t->type) {
             t_offset += ggml_hexagon_bf16_mirror_offset(t);
         }
 
@@ -5675,7 +5690,7 @@ static void ggml_hexagon_precompute_fused_mmnx_params(
     const int ne12 = src1->ne[2];
     const int ne13 = src1->ne[3];
 
-    const int wtype = src0->type;
+    const int wtype = ggml_hexagon_weight_type(src0);
     const bool is_repack = ggml_hexagon_is_repack_type((ggml_type) wtype);
     const int ne00_padded = is_repack ? hex_round_up(ne00, 32) : ne00;
     const int ne01_padded = is_repack ? hex_round_up(ne01, 32) : ne01;
@@ -5815,7 +5830,7 @@ static bool ggml_hexagon_supported_mul_mat(const struct ggml_hexagon_session * s
             break;
 
         case GGML_TYPE_BF16:
-            if (!ggml_hexagon_is_bf16_weight(src0) || src1->type != GGML_TYPE_F32 ||
+            if (!opt_bf16 || !ggml_hexagon_is_bf16_weight(src0) || src1->type != GGML_TYPE_F32 ||
                 ggml_hexagon_tensor_is_host(sess, src0)) {
                 return false;
             }
@@ -6803,7 +6818,7 @@ static bool is_mergeable_mul_mat(const ggml_tensor * t) {
     if (src0->ne[2] != 1 || src0->ne[3] != 1) return false;
 
     if (mm_is_hmx_eligible(t)) {
-        return ggml_hexagon_is_hmx_weight_type(src0->type);
+        return ggml_hexagon_is_hmx_weight_type(ggml_hexagon_weight_type(src0));
     }
 
     return ggml_hexagon_is_repack_type(src0->type) && src0->type != GGML_TYPE_Q6_K;
@@ -8318,6 +8333,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     const char * str_optrace  = getenv("GGML_HEXAGON_OPTRACE");
     const char * str_hostbuf  = getenv("GGML_HEXAGON_HOSTBUF");
     const char * str_dma64    = getenv("GGML_HEXAGON_DMA64");
+    const char * str_bf16     = getenv("GGML_HEXAGON_BF16");
 
     // Init Arch first since it affects other defaults
     if (!str_arch) {
@@ -8367,6 +8383,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     opt_mbuf      = str_mbuf     ? strtoul(str_mbuf, NULL, 0) * MiB       : opt_mbuf;
     opt_vmem      = str_vmem     ? strtoul(str_vmem, NULL, 0) * MiB       : opt_vmem;
     opt_hostbuf   = str_hostbuf  ? atoi(str_hostbuf) != 0                 : opt_hostbuf;
+    opt_bf16      = str_bf16     ? atoi(str_bf16) != 0                    : opt_bf16;
 
     // Parse device configuration
     const char * str_devices  = getenv("GGML_HEXAGON_DEVICES");
