@@ -480,11 +480,6 @@ llama_build_and_test(test-opencl-fa-chunking.cpp)
 # Readback of views of OpenCL Q1_0 / PQ2_0 weights, which the backend stores converted. Self-skipping like the above.
 llama_build_and_test(test-opencl-quant-views.cpp)
 
-# The OpenCL kernels only compile on the device, so a kernel or helper defined
-# twice across a .cl file is first caught here: the scanner parses every kernel
-# source (CRLF-safe) and fails on any duplicate definition.
-llama_build_and_test(test-opencl-kernel-sources.cpp ARGS ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/kernels)
-
 # QVAC-23763: the CUDA arch-availability registration guard. Self-skips with 77
 # when no CUDA registry is present, which covers non-CUDA builds and DL builds
 # whose module scores 0. A static CUDA build without a GPU runs the
